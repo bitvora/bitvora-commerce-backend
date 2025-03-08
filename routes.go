@@ -61,6 +61,19 @@ func InitRoutes() http.Handler {
 		r.Post("/invoice", walletHandler.MakeInvoice)
 		r.Post("/checkout", checkoutHandler.Create)
 		r.Get("/checkout/{id}", checkoutHandler.Get)
+
+		// Payment links routes (protected)
+		r.Route("/payment-link", func(r chi.Router) {
+			r.Get("/", paymentLinkHandler.List)
+			r.Post("/", paymentLinkHandler.Create)
+			r.Get("/{id}", paymentLinkHandler.Get)
+			r.Put("/{id}", paymentLinkHandler.Update)
+			r.Delete("/{id}", paymentLinkHandler.Delete)
+			r.Get("/account/{accountID}", paymentLinkHandler.ListByAccount)
+		})
+
+		// Public payment link endpoint
+		r.Get("/l/{id}", paymentLinkHandler.PublicLinkHandler)
 	})
 
 	return r
