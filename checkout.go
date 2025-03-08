@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -157,7 +156,6 @@ func (s *CheckoutService) handleExpiredCheckouts() {
 		case <-s.expirationTicker.C:
 			expiredCheckouts, err := checkoutRepository.GetExpiredCheckouts()
 			if err != nil {
-				log.Printf("Error getting expired checkouts: %v", err)
 				continue
 			}
 
@@ -166,7 +164,6 @@ func (s *CheckoutService) handleExpiredCheckouts() {
 				checkout.UpdatedAt = time.Now()
 
 				if err := checkoutRepository.Update(checkout); err != nil {
-					log.Printf("Error updating expired checkout %s: %v", checkout.ID, err)
 					continue
 				}
 
@@ -194,10 +191,13 @@ func (s *CheckoutService) Create(checkout *Checkout) (*Checkout, error) {
 		description := fmt.Sprintf("Checkout #%s", checkout.ID.String())
 
 		invoice, err := walletService.MakeInvoice(wallet.ID, checkout.Amount, description, expirySeconds)
-		if err != nil {
-			log.Printf("Failed to generate lightning invoice: %v", err)
-		} else {
+		if err == nil {
 			checkout.LightningInvoice = &invoice
+		}
+
+		chainAddress, err := walletService.MakeChainAddress(wallet.ID)
+		if err == nil {
+			checkout.BitcoinAddress = &chainAddress
 		}
 	}
 

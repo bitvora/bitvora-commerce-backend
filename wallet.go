@@ -191,8 +191,9 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 								wallet, ok := walletInterface.(*WalletConnection)
 								if ok {
 									decryptedContent, err := l.decryptEventContent(wallet, event)
+									fmt.Println("Decrypted content", decryptedContent)
 									if err == nil {
-										// Try to parse payment information from decrypted content
+
 										var paymentResponse struct {
 											Result struct {
 												PaymentHash string `json:"payment_hash"`
@@ -204,7 +205,7 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 										}
 
 										if err := json.Unmarshal([]byte(decryptedContent), &paymentResponse); err == nil && paymentResponse.Error == nil {
-											// Look for checkouts with this invoice
+
 											checkouts := []*Checkout{}
 											err := db.Select(&checkouts, "SELECT * FROM checkouts WHERE lightning_invoice=$1 AND state=$2",
 												paymentResponse.Result.Invoice, CheckoutStateOpen)
@@ -214,14 +215,12 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 													newState := CheckoutStatePaid
 													receivedAmount := paymentResponse.Result.Amount
 
-													// Check if underpaid or overpaid
 													if receivedAmount < checkout.Amount {
 														newState = CheckoutStateUnderpaid
 													} else if receivedAmount > checkout.Amount {
 														newState = CheckoutStateOverpaid
 													}
 
-													// Update checkout state
 													checkoutService.UpdateState(checkout.ID, newState, receivedAmount)
 												}
 											}
@@ -1013,6 +1012,79 @@ func (s *WalletService) MakeInvoice(walletID uuid.UUID, amountMsat int64, descri
 		pool.PublishMany(ctx, []string{wallet.NostrRelay}, event)
 		return "", fmt.Errorf("wallet listener not initialized, cannot wait for response")
 	}
+}
+
+func (s *WalletService) MakeChainAddress(walletID uuid.UUID) (string, error) {
+	wallet, err := s.Get(walletID)
+	if err != nil {
+		return "", err
+	}
+
+	request := struct {
+		Method string `json:"method"`
+		Params struct {
+		} `json:"params"`
+	}{
+		Method: "make_chain_address",
+		Params: struct{}{},
+	}
+
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
+	if err != nil {
+		return "", fmt.Errorf("failed to compute shared secret: %w", err)
+	}
+
+	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt content: %w", err)
+	}
+
+	fmt.Println("Encrypted content", string(requestJSON))
+
+	event := nostr.Event{
+		Kind:      nostr.KindNWCWalletRequest,
+		PubKey:    wallet.NostrPubkey,
+		CreatedAt: nostr.Now(),
+		Content:   encryptedContent,
+		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
+	}
+
+	event.Sign(wallet.NostrSecret)
+
+	if walletListener != nil {
+		walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
+	}
+
+	responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("error waiting for chain address: %w", err)
+	}
+
+	var response struct {
+		Result struct {
+			Address string `json:"address"`
+		} `json:"result"`
+		Error *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+
+	if err := json.Unmarshal(responseData, &response); err != nil {
+		return "", fmt.Errorf("failed to parse chain address response: %w", err)
+	}
+
+	if response.Error != nil {
+		return "", fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
+	}
+
+	return response.Result.Address, nil
+
 }
 
 func (s *WalletService) UpdateWalletConnectionsCache() error {
