@@ -36,7 +36,6 @@ func InitRoutes() http.Handler {
 		r.Get("/product/account/{accountId}", productHandler.GetByAccount)
 		r.Delete("/product/{id}", productHandler.Delete)
 
-		// Customer routes
 		r.Post("/customer", customerHandler.Create)
 		r.Put("/customer/{id}", customerHandler.Update)
 		r.Get("/customer", customerHandler.GetAll)
@@ -44,7 +43,6 @@ func InitRoutes() http.Handler {
 		r.Get("/customer/account/{accountId}", customerHandler.GetByAccount)
 		r.Delete("/customer/{id}", customerHandler.Delete)
 
-		// Subscription routes
 		r.Post("/subscription", subscriptionHandler.Create)
 		r.Put("/subscription/{id}", subscriptionHandler.Update)
 		r.Get("/subscription", subscriptionHandler.GetAll)
@@ -53,6 +51,14 @@ func InitRoutes() http.Handler {
 		r.Get("/subscription/customer/{customerId}", subscriptionHandler.GetByCustomer)
 		r.Get("/subscription/product/{productId}", subscriptionHandler.GetByProduct)
 		r.Delete("/subscription/{id}", subscriptionHandler.Delete)
+
+		r.Post("/wallet", walletHandler.Create)
+		r.Get("/wallet", walletHandler.GetAll)
+		r.Get("/wallet/{id}", walletHandler.Get)
+		r.Get("/wallet/account/{accountId}", walletHandler.GetByAccount)
+		r.Delete("/wallet/{id}", walletHandler.Delete)
+
+		r.Post("/invoice", walletHandler.MakeInvoice)
 	})
 
 	return r
