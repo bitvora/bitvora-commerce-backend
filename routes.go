@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-chi/chi/middleware"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
 )
 
 func InitRoutes() http.Handler {
@@ -14,10 +15,20 @@ func InitRoutes() http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 
+	// allow cors
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"http://localhost:3000"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token", "Session-ID"},
+		AllowCredentials: true,
+	}))
+
 	r.Get("/", HandleHome)
 	r.Post("/register", userHandler.Register)
 	r.Post("/login", userHandler.Login)
 	r.Post("/logout", userHandler.Logout)
+	r.Get("/l/{id}", paymentLinkHandler.PublicLinkHandler)
+	r.Get("/c/{id}", checkoutHandler.PublicLinkHandler)
 
 	r.Group(func(r chi.Router) {
 		r.Use(AuthMiddleware)
@@ -61,6 +72,7 @@ func InitRoutes() http.Handler {
 		r.Post("/invoice", walletHandler.MakeInvoice)
 		r.Post("/checkout", checkoutHandler.Create)
 		r.Get("/checkout/{id}", checkoutHandler.Get)
+		r.Get("/checkout/account/{accountId}", checkoutHandler.GetAllByAccount)
 
 		// Payment links routes (protected)
 		r.Route("/payment-link", func(r chi.Router) {
@@ -71,9 +83,6 @@ func InitRoutes() http.Handler {
 			r.Delete("/{id}", paymentLinkHandler.Delete)
 			r.Get("/account/{accountID}", paymentLinkHandler.ListByAccount)
 		})
-
-		// Public payment link endpoint
-		r.Get("/l/{id}", paymentLinkHandler.PublicLinkHandler)
 	})
 
 	return r

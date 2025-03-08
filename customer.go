@@ -139,7 +139,7 @@ func (h *CustomerHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		AccountID            uuid.UUID `json:"account_id" validate:"required"`
 		Name                 *string   `json:"name,omitempty"`
-		Email                *string   `json:"email,omitempty" validate:"omitempty,email"`
+		Email                *string   `json:"email,omitempty"`
 		Description          *string   `json:"description,omitempty"`
 		BillingAddressLine1  *string   `json:"billing_address_line1,omitempty"`
 		BillingAddressLine2  *string   `json:"billing_address_line2,omitempty"`
