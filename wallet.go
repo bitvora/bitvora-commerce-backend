@@ -192,8 +192,43 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 								if ok {
 									decryptedContent, err := l.decryptEventContent(wallet, event)
 									if err == nil {
-										promise.Response <- []byte(decryptedContent)
-										return
+										// Try to parse payment information from decrypted content
+										var paymentResponse struct {
+											Result struct {
+												PaymentHash string `json:"payment_hash"`
+												Amount      int64  `json:"amount_msat"`
+												Preimage    string `json:"preimage"`
+												Invoice     string `json:"invoice,omitempty"`
+											} `json:"result"`
+											Error *struct{} `json:"error,omitempty"`
+										}
+
+										if err := json.Unmarshal([]byte(decryptedContent), &paymentResponse); err == nil && paymentResponse.Error == nil {
+											// Look for checkouts with this invoice
+											checkouts := []*Checkout{}
+											err := db.Select(&checkouts, "SELECT * FROM checkouts WHERE lightning_invoice=$1 AND state=$2",
+												paymentResponse.Result.Invoice, CheckoutStateOpen)
+
+											if err == nil && len(checkouts) > 0 {
+												for _, checkout := range checkouts {
+													newState := CheckoutStatePaid
+													receivedAmount := paymentResponse.Result.Amount
+
+													// Check if underpaid or overpaid
+													if receivedAmount < checkout.Amount {
+														newState = CheckoutStateUnderpaid
+													} else if receivedAmount > checkout.Amount {
+														newState = CheckoutStateOverpaid
+													}
+
+													// Update checkout state
+													checkoutService.UpdateState(checkout.ID, newState, receivedAmount)
+												}
+											}
+
+											promise.Response <- []byte(decryptedContent)
+											return
+										}
 									}
 								}
 							}

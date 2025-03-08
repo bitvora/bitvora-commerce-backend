@@ -59,6 +59,8 @@ func InitRoutes() http.Handler {
 		r.Delete("/wallet/{id}", walletHandler.Delete)
 
 		r.Post("/invoice", walletHandler.MakeInvoice)
+		r.Post("/checkout", checkoutHandler.Create)
+		r.Get("/checkout/{id}", checkoutHandler.Get)
 	})
 
 	return r
