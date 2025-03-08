@@ -16,6 +16,7 @@ func main() {
 
 	InitDB()
 	r := InitRoutes()
+	go walletListener.Start()
 
 	port := os.Getenv("APP_PORT")
 	if port == "" {
