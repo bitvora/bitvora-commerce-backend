@@ -130,6 +130,12 @@ func (r *CheckoutRepository) GetExpiredCheckouts() ([]*Checkout, error) {
 	return checkouts, err
 }
 
+func (r *CheckoutRepository) GetAllByAccount(accountID uuid.UUID) ([]*Checkout, error) {
+	checkouts := []*Checkout{}
+	err := db.Select(&checkouts, "SELECT * FROM checkouts WHERE account_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC", accountID)
+	return checkouts, err
+}
+
 type CheckoutService struct {
 	expirationTicker *time.Ticker
 	done             chan bool
@@ -245,6 +251,10 @@ func (s *CheckoutService) GetByAccount(accountID uuid.UUID) ([]*Checkout, error)
 	return checkoutRepository.GetByAccount(accountID)
 }
 
+func (s *CheckoutService) GetAllByAccount(accountID uuid.UUID) ([]*Checkout, error) {
+	return checkoutRepository.GetAllByAccount(accountID)
+}
+
 type CheckoutHandler struct {
 	Validator *validator.Validate
 }
@@ -344,6 +354,40 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *CheckoutHandler) Get(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid checkout ID", err.Error())
+		return
+	}
+
+	checkout, err := checkoutService.Get(id)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Checkout not found", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, "Checkout retrieved successfully", checkout)
+}
+
+func (h *CheckoutHandler) GetAllByAccount(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountId")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	checkouts, err := checkoutService.GetAllByAccount(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving checkouts", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, "Checkouts retrieved successfully", checkouts)
+}
+
+func (h *CheckoutHandler) PublicLinkHandler(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 	id, err := uuid.Parse(idStr)
 	if err != nil {
