@@ -174,6 +174,10 @@ func (s *CheckoutService) handleExpiredCheckouts() {
 				}
 
 				checkoutCache.Set(checkout)
+
+				// Add notifications for expired checkouts
+				webhookService.DeliverWebhook(WebhookEventCheckoutExpired, checkout.AccountID, checkout)
+				notificationService.SendNotification(NotificationEventCheckoutExpired, checkout.AccountID, checkout)
 			}
 
 		case <-s.done:
@@ -214,8 +218,8 @@ func (s *CheckoutService) Create(checkout *Checkout) (*Checkout, error) {
 
 	checkoutCache.Set(createdCheckout)
 
-	// Deliver webhook for checkout creation
-	webhookService.DeliverWebhook(WebhookEventCheckoutCreated, createdCheckout.AccountID, createdCheckout)
+	go webhookService.DeliverWebhook(WebhookEventCheckoutCreated, createdCheckout.AccountID, createdCheckout)
+	go notificationService.SendNotification(NotificationEventCheckoutCreated, createdCheckout.AccountID, createdCheckout)
 
 	return createdCheckout, nil
 }
@@ -252,23 +256,32 @@ func (s *CheckoutService) UpdateState(id uuid.UUID, state CheckoutState, receive
 
 	checkoutCache.Set(checkout)
 
-	// If state changed, fire the appropriate webhook event
+	// If state changed, fire the appropriate webhook event and notification
 	if previousState != state {
 		var event WebhookEvent
+		var notificationEvent NotificationEvent
 
 		switch state {
 		case CheckoutStatePaid:
 			event = WebhookEventCheckoutPaid
+			notificationEvent = NotificationEventCheckoutPaid
 		case CheckoutStateUnderpaid:
 			event = WebhookEventCheckoutUnderpaid
+			notificationEvent = NotificationEventCheckoutUnderpaid
 		case CheckoutStateOverpaid:
 			event = WebhookEventCheckoutOverpaid
+			notificationEvent = NotificationEventCheckoutOverpaid
 		case CheckoutStateExpired:
 			event = WebhookEventCheckoutExpired
+			notificationEvent = NotificationEventCheckoutExpired
 		}
 
 		if event != "" {
 			webhookService.DeliverWebhook(event, checkout.AccountID, checkout)
+		}
+
+		if notificationEvent != "" {
+			notificationService.SendNotification(notificationEvent, checkout.AccountID, checkout)
 		}
 	}
 

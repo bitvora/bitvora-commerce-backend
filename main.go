@@ -11,8 +11,12 @@ import (
 func main() {
 	err := godotenv.Load()
 	if err != nil {
-		log.Fatal("Error loading .env file")
+		log.Fatalf("Error loading .env file")
 	}
+
+	notificationService = NewNotificationService()
+	webhookService = NewWebhookService()
+	checkoutService = NewCheckoutService()
 
 	InitDB()
 	r := InitRoutes()
