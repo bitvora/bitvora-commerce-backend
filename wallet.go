@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip04"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -230,6 +231,8 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 	if err != nil {
 		return // Failed to decrypt content
 	}
+
+	logrus.Info("got event", event.ID, decryptedContent)
 	// Parse payment response
 	var paymentResponse struct {
 		Result struct {

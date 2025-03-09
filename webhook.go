@@ -756,22 +756,7 @@ func (h *WebhookHandler) GetByAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	webhooksResponse := make([]WebhookWithoutSecret, len(webhooks))
-	for i, webhook := range webhooks {
-		webhooksResponse[i] = WebhookWithoutSecret{
-			ID:          webhook.ID,
-			UserID:      webhook.UserID,
-			AccountID:   webhook.AccountID,
-			URL:         webhook.URL,
-			Description: webhook.Description,
-			Enabled:     webhook.Enabled,
-			Events:      webhook.Events,
-			CreatedAt:   webhook.CreatedAt,
-			UpdatedAt:   webhook.UpdatedAt,
-		}
-	}
-
-	JsonResponse(w, http.StatusOK, "Webhooks retrieved successfully", webhooksResponse)
+	JsonResponse(w, http.StatusOK, "Webhooks retrieved successfully", webhooks)
 }
 
 func (h *WebhookHandler) Update(w http.ResponseWriter, r *http.Request) {

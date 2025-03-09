@@ -61,10 +61,10 @@ func InitRoutes() http.Handler {
 			r.Delete("/{id}", webhookHandler.Delete)
 			r.Post("/{id}/regenerate-secret", webhookHandler.RegenerateSecret)
 			r.Get("/account/{accountId}", webhookHandler.GetByAccount)
-		})
 
-		r.Get("/webhooks/{id}/deliveries", webhookHandler.GetDeliveries)
-		r.Post("/webhooks/deliveries/{deliveryId}/retry", webhookHandler.RetryDelivery)
+			r.Get("/{id}/deliveries", webhookHandler.GetDeliveries)
+			r.Post("/{id}/deliveries/{deliveryId}/retry", webhookHandler.RetryDelivery)
+		})
 
 		r.Post("/product", productHandler.Create)
 		r.Put("/product/{id}", productHandler.Update)
