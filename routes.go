@@ -43,7 +43,6 @@ func InitRoutes() http.Handler {
 		r.Get("/account/{id}", accountHandler.Get)
 		r.Delete("/account/{id}", accountHandler.Delete)
 
-		// API Key routes
 		r.Route("/api-key", func(r chi.Router) {
 			r.Post("/", apiKeyHandler.Create)
 			r.Get("/", apiKeyHandler.GetAll)
@@ -54,7 +53,6 @@ func InitRoutes() http.Handler {
 			r.Get("/account/{accountId}", apiKeyHandler.GetByAccount)
 		})
 
-		// Webhook routes
 		r.Route("/webhook", func(r chi.Router) {
 			r.Post("/", webhookHandler.Create)
 			r.Get("/{id}", webhookHandler.Get)
@@ -63,6 +61,9 @@ func InitRoutes() http.Handler {
 			r.Post("/{id}/regenerate-secret", webhookHandler.RegenerateSecret)
 			r.Get("/account/{accountId}", webhookHandler.GetByAccount)
 		})
+
+		r.Get("/webhooks/{id}/deliveries", webhookHandler.GetDeliveries)
+		r.Post("/webhooks/deliveries/{deliveryId}/retry", webhookHandler.RetryDelivery)
 
 		r.Post("/product", productHandler.Create)
 		r.Put("/product/{id}", productHandler.Update)
@@ -98,7 +99,6 @@ func InitRoutes() http.Handler {
 		r.Get("/checkout/{id}", checkoutHandler.Get)
 		r.Get("/checkout/account/{accountId}", checkoutHandler.GetAllByAccount)
 
-		// Payment links routes (protected)
 		r.Route("/payment-link", func(r chi.Router) {
 			r.Get("/", paymentLinkHandler.List)
 			r.Post("/", paymentLinkHandler.Create)
