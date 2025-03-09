@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
 )
 
 type CheckoutState string
@@ -447,6 +448,153 @@ func (h *CheckoutHandler) PublicLinkHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	JsonResponse(w, http.StatusOK, "Checkout retrieved successfully", checkout)
+}
+
+// Transaction represents a wallet transaction returned from the wallet service
+type Transaction struct {
+	Type            string          `json:"type"`
+	Invoice         string          `json:"invoice,omitempty"`
+	Description     string          `json:"description,omitempty"`
+	DescriptionHash string          `json:"description_hash,omitempty"`
+	Preimage        string          `json:"preimage,omitempty"`
+	PaymentHash     string          `json:"payment_hash"`
+	Amount          int64           `json:"amount"`
+	FeesPaid        int64           `json:"fees_paid,omitempty"`
+	CreatedAt       int64           `json:"created_at"`
+	ExpiresAt       *int64          `json:"expires_at,omitempty"`
+	SettledAt       *int64          `json:"settled_at,omitempty"`
+	Metadata        json.RawMessage `json:"metadata,omitempty"`
+}
+
+// TransactionResponse represents the response from the wallet service for a list_transactions request
+type TransactionResponse struct {
+	ResultType string `json:"result_type"`
+	Result     struct {
+		Transactions []Transaction `json:"transactions"`
+	} `json:"result"`
+	Error *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+func (h *CheckoutHandler) PollInvoice(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid checkout ID", err.Error())
+		return
+	}
+
+	checkout, err := checkoutService.Get(id)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Checkout not found", err.Error())
+		return
+	}
+
+	// Check if the checkout is already paid
+	if checkout.State == CheckoutStatePaid || checkout.State == CheckoutStateOverpaid {
+		JsonResponse(w, http.StatusOK, "Checkout already paid", checkout)
+		return
+	}
+
+	// Check if the checkout is expired
+	if checkout.State == CheckoutStateExpired {
+		JsonResponse(w, http.StatusBadRequest, "Checkout expired", nil)
+		return
+	}
+
+	// Make sure we have a lightning invoice to check
+	if checkout.LightningInvoice == nil || *checkout.LightningInvoice == "" {
+		JsonResponse(w, http.StatusBadRequest, "No lightning invoice to check", nil)
+		return
+	}
+
+	// Get the active wallet for this account
+	wallet, err := walletService.GetActiveWalletByAccount(checkout.AccountID)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving wallet connections", err.Error())
+		return
+	}
+
+	// Request transaction list from wallet
+	responseData, err := walletService.ListTransactions(wallet.ID, 0, 0, 50, 0, false, "incoming")
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error checking invoice status", err.Error())
+		return
+	}
+
+	// Parse the response
+	var response TransactionResponse
+	if err := json.Unmarshal(responseData, &response); err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Failed to parse transaction response", err.Error())
+		return
+	}
+
+	if response.Error != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Wallet error", response.Error.Message)
+		return
+	}
+
+	// Look for our invoice in the transactions
+	var matchingTransaction *Transaction
+	for i, tx := range response.Result.Transactions {
+		jsonTx, _ := json.Marshal(tx)
+		checkout.LightningInvoice = &tx.Invoice
+		logrus.Info("transaction", string(jsonTx))
+		logrus.Info("checkout.LightningInvoice", *checkout.LightningInvoice)
+
+		if tx.Invoice == *checkout.LightningInvoice {
+			logrus.Info("transaction", string(jsonTx))
+			matchingTransaction = &response.Result.Transactions[i]
+			break
+		}
+	}
+
+	if matchingTransaction == nil {
+		JsonResponse(w, http.StatusNotFound, "Invoice not found in wallet transactions", nil)
+		return
+	}
+
+	// Check if the invoice is settled (paid)
+	if matchingTransaction.SettledAt != nil && matchingTransaction.Preimage != "" {
+		// Update checkout state
+		newState := CheckoutStatePaid
+		receivedAmount := matchingTransaction.Amount
+
+		if receivedAmount < checkout.Amount {
+			newState = CheckoutStateUnderpaid
+		} else if receivedAmount > checkout.Amount {
+			newState = CheckoutStateOverpaid
+		}
+
+		err = checkoutService.UpdateState(checkout.ID, newState, receivedAmount)
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error updating checkout state", err.Error())
+			return
+		}
+
+		// Get the updated checkout
+		checkout, err = checkoutService.Get(id)
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving updated checkout", err.Error())
+			return
+		}
+
+		JsonResponse(w, http.StatusOK, "Invoice paid", map[string]interface{}{
+			"checkout":    checkout,
+			"transaction": matchingTransaction,
+			"paid":        true,
+		})
+		return
+	}
+
+	// Invoice not yet paid
+	JsonResponse(w, http.StatusOK, "Invoice not yet paid", map[string]interface{}{
+		"checkout":    checkout,
+		"transaction": matchingTransaction,
+		"paid":        false,
+	})
 }
 
 func init() {

@@ -19,7 +19,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip04"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -231,9 +230,6 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 	if err != nil {
 		return // Failed to decrypt content
 	}
-
-	log.Info("handling event", decryptedContent)
-
 	// Parse payment response
 	var paymentResponse struct {
 		Result struct {
@@ -1128,4 +1124,97 @@ func (s *WalletService) UpdateWalletConnectionsCache() error {
 		return walletListener.loadWalletConnectionsToMemory()
 	}
 	return nil
+}
+
+func (s *WalletService) ListTransactions(walletID uuid.UUID, from, until int64, limit, offset int, unpaid bool, txType string) ([]byte, error) {
+	wallet, err := s.Get(walletID)
+	if err != nil {
+		return nil, err
+	}
+
+	params := map[string]interface{}{}
+
+	if from > 0 {
+		params["from"] = from
+	}
+	if until > 0 {
+		params["until"] = until
+	}
+	if limit > 0 {
+		params["limit"] = limit
+	}
+	if offset > 0 {
+		params["offset"] = offset
+	}
+	if unpaid {
+		params["unpaid"] = unpaid
+	}
+	if txType != "" {
+		params["type"] = txType
+	}
+
+	request := struct {
+		Method string                 `json:"method"`
+		Params map[string]interface{} `json:"params"`
+	}{
+		Method: "list_transactions",
+		Params: params,
+	}
+
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute shared secret: %w", err)
+	}
+
+	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt content: %w", err)
+	}
+
+	event := nostr.Event{
+		Kind:      nostr.KindNWCWalletRequest,
+		PubKey:    wallet.NostrPubkey,
+		CreatedAt: nostr.Now(),
+		Content:   encryptedContent,
+		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
+	}
+
+	event.Sign(wallet.NostrSecret)
+
+	if walletListener != nil {
+		walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
+
+		responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("error waiting for transactions: %w", err)
+		}
+
+		var response struct {
+			Result json.RawMessage `json:"result"`
+			Error  *struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error,omitempty"`
+		}
+
+		if err := json.Unmarshal(responseData, &response); err != nil {
+			return nil, fmt.Errorf("failed to parse transaction list response: %w", err)
+		}
+
+		if response.Error != nil {
+			return nil, fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
+		}
+
+		return responseData, nil
+	} else {
+		ctx := context.Background()
+		pool := nostr.NewSimplePool(ctx)
+		pool.PublishMany(ctx, []string{wallet.NostrRelay}, event)
+		return nil, fmt.Errorf("wallet listener not initialized, cannot wait for response")
+	}
 }
