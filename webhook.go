@@ -8,7 +8,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -118,6 +120,29 @@ func (c *WebhookCache) SetForAccount(accountID uuid.UUID, webhooks []*Webhook) {
 
 func (c *WebhookCache) InvalidateForAccount(accountID uuid.UUID) {
 	c.cache.Delete(accountID)
+}
+
+type WebhookDeliveryStatus string
+
+const (
+	WebhookDeliveryStatusPending    WebhookDeliveryStatus = "pending"
+	WebhookDeliveryStatusSuccessful WebhookDeliveryStatus = "successful"
+	WebhookDeliveryStatusFailed     WebhookDeliveryStatus = "failed"
+)
+
+// WebhookDelivery represents a webhook delivery attempt
+type WebhookDelivery struct {
+	ID                 uuid.UUID             `db:"id" json:"id"`
+	WebhookID          uuid.UUID             `db:"webhook_id" json:"webhook_id"`
+	EventType          WebhookEvent          `db:"event_type" json:"event_type"`
+	Status             WebhookDeliveryStatus `db:"status" json:"status"`
+	RequestPayload     json.RawMessage       `db:"request_payload" json:"request_payload"`
+	ResponseBody       string                `db:"response_body" json:"response_body"`
+	ResponseStatusCode int                   `db:"response_status_code" json:"response_status_code"`
+	DurationMs         int                   `db:"duration_ms" json:"duration_ms"`
+	ErrorMessage       string                `db:"error_message" json:"error_message"`
+	CreatedAt          time.Time             `db:"created_at" json:"created_at"`
+	UpdatedAt          time.Time             `db:"updated_at" json:"updated_at"`
 }
 
 type WebhookRepository struct{}
@@ -230,6 +255,66 @@ func (r *WebhookRepository) Delete(id uuid.UUID) error {
 			deleted_at = $1
 		WHERE id = $2`,
 		now, id,
+	)
+	return err
+}
+
+func (r *WebhookRepository) CreateDelivery(delivery *WebhookDelivery) error {
+	_, err := db.Exec(`
+		INSERT INTO webhook_deliveries (
+			id, webhook_id, event_type, status, request_payload, 
+			response_body, response_status_code, duration_ms, error_message,
+			created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+		)`,
+		delivery.ID, delivery.WebhookID, delivery.EventType, delivery.Status,
+		delivery.RequestPayload, delivery.ResponseBody, delivery.ResponseStatusCode,
+		delivery.DurationMs, delivery.ErrorMessage, delivery.CreatedAt, delivery.UpdatedAt,
+	)
+	return err
+}
+
+func (r *WebhookRepository) GetDelivery(id uuid.UUID) (*WebhookDelivery, error) {
+	delivery := &WebhookDelivery{}
+	err := db.Get(delivery, `
+		SELECT id, webhook_id, event_type, status, request_payload, 
+			response_body, response_status_code, duration_ms, error_message,
+			created_at, updated_at
+		FROM webhook_deliveries
+		WHERE id = $1`,
+		id,
+	)
+	return delivery, err
+}
+
+func (r *WebhookRepository) GetDeliveriesByWebhook(webhookID uuid.UUID, limit, offset int) ([]*WebhookDelivery, error) {
+	deliveries := []*WebhookDelivery{}
+	err := db.Select(&deliveries, `
+		SELECT id, webhook_id, event_type, status, request_payload, 
+			response_body, response_status_code, duration_ms, error_message,
+			created_at, updated_at
+		FROM webhook_deliveries
+		WHERE webhook_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3`,
+		webhookID, limit, offset,
+	)
+	return deliveries, err
+}
+
+func (r *WebhookRepository) UpdateDelivery(delivery *WebhookDelivery) error {
+	_, err := db.Exec(`
+		UPDATE webhook_deliveries SET 
+			status = $1,
+			response_body = $2,
+			response_status_code = $3,
+			duration_ms = $4,
+			error_message = $5,
+			updated_at = $6
+		WHERE id = $7`,
+		delivery.Status, delivery.ResponseBody, delivery.ResponseStatusCode,
+		delivery.DurationMs, delivery.ErrorMessage, delivery.UpdatedAt, delivery.ID,
 	)
 	return err
 }
@@ -392,31 +477,129 @@ func (s *WebhookService) DeliverWebhook(event WebhookEvent, accountID uuid.UUID,
 
 	for _, webhook := range webhooks {
 		go func(wh *Webhook) {
-			signature := s.GenerateSignature(payloadBytes, wh.Secret)
-
-			req, err := http.NewRequest("POST", wh.URL, bytes.NewBuffer(payloadBytes))
-			if err != nil {
-				fmt.Printf("Error creating webhook request: %v\n", err)
-				return
-			}
-
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Signature", signature)
-			req.Header.Set("X-Webhook-ID", fmt.Sprintf("%s", wh.ID))
-			req.Header.Set("X-Event", string(event))
-
-			resp, err := s.httpClient.Do(req)
-			if err != nil {
-				fmt.Printf("Error delivering webhook: %v\n", err)
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode >= 300 {
-				fmt.Printf("Webhook delivery error: status code %d\n", resp.StatusCode)
-			}
+			s.deliverSingleWebhook(wh, event, payloadBytes)
 		}(webhook)
 	}
+}
+
+func (s *WebhookService) deliverSingleWebhook(webhook *Webhook, event WebhookEvent, payloadBytes []byte) {
+	deliveryID := uuid.New()
+	startTime := time.Now()
+
+	// Create initial delivery record with pending status
+	delivery := &WebhookDelivery{
+		ID:             deliveryID,
+		WebhookID:      webhook.ID,
+		EventType:      event,
+		Status:         WebhookDeliveryStatusPending,
+		RequestPayload: payloadBytes,
+		CreatedAt:      startTime,
+		UpdatedAt:      startTime,
+	}
+
+	err := webhookRepository.CreateDelivery(delivery)
+	if err != nil {
+		fmt.Printf("Error creating webhook delivery record: %v\n", err)
+		// Continue with delivery attempt even if logging fails
+	}
+
+	signature := s.GenerateSignature(payloadBytes, webhook.Secret)
+
+	req, err := http.NewRequest("POST", webhook.URL, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		endTime := time.Now()
+		duration := int(endTime.Sub(startTime).Milliseconds())
+
+		delivery.Status = WebhookDeliveryStatusFailed
+		delivery.ErrorMessage = fmt.Sprintf("Error creating request: %v", err)
+		delivery.DurationMs = duration
+		delivery.UpdatedAt = endTime
+
+		_ = webhookRepository.UpdateDelivery(delivery)
+		fmt.Printf("Error creating webhook request: %v\n", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Signature", signature)
+	req.Header.Set("X-Webhook-ID", fmt.Sprintf("%s", webhook.ID))
+	req.Header.Set("X-Event", string(event))
+
+	resp, err := s.httpClient.Do(req)
+	endTime := time.Now()
+	duration := int(endTime.Sub(startTime).Milliseconds())
+
+	delivery.DurationMs = duration
+	delivery.UpdatedAt = endTime
+
+	if err != nil {
+		delivery.Status = WebhookDeliveryStatusFailed
+		delivery.ErrorMessage = fmt.Sprintf("Error sending request: %v", err)
+
+		_ = webhookRepository.UpdateDelivery(delivery)
+		fmt.Printf("Error delivering webhook: %v\n", err)
+		return
+	}
+
+	// Read response body
+	respBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	delivery.ResponseStatusCode = resp.StatusCode
+	delivery.ResponseBody = string(respBody)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		delivery.Status = WebhookDeliveryStatusSuccessful
+	} else {
+		delivery.Status = WebhookDeliveryStatusFailed
+		delivery.ErrorMessage = fmt.Sprintf("Webhook delivery failed with status code: %d", resp.StatusCode)
+		fmt.Printf("Webhook delivery error: status code %d\n", resp.StatusCode)
+	}
+
+	_ = webhookRepository.UpdateDelivery(delivery)
+}
+
+func (s *WebhookService) RetryDelivery(deliveryID uuid.UUID) (*WebhookDelivery, error) {
+	delivery, err := webhookRepository.GetDelivery(deliveryID)
+	if err != nil {
+		return nil, err
+	}
+
+	webhook, err := webhookRepository.Get(delivery.WebhookID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a new delivery record based on the failed one
+	newDelivery := &WebhookDelivery{
+		ID:             uuid.New(),
+		WebhookID:      webhook.ID,
+		EventType:      delivery.EventType,
+		Status:         WebhookDeliveryStatusPending,
+		RequestPayload: delivery.RequestPayload,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+
+	err = webhookRepository.CreateDelivery(newDelivery)
+	if err != nil {
+		return nil, err
+	}
+
+	// Deliver the webhook in the background
+	go func() {
+		s.deliverSingleWebhook(webhook, delivery.EventType, delivery.RequestPayload)
+	}()
+
+	return newDelivery, nil
+}
+
+func (s *WebhookService) GetDelivery(id uuid.UUID) (*WebhookDelivery, error) {
+	return webhookRepository.GetDelivery(id)
+}
+
+func (s *WebhookService) GetDeliveriesByWebhook(webhookID uuid.UUID, limit, offset int) ([]*WebhookDelivery, error) {
+	return webhookRepository.GetDeliveriesByWebhook(webhookID, limit, offset)
 }
 
 type WebhookHandler struct {
@@ -752,6 +935,112 @@ func (h *WebhookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	JsonResponse(w, http.StatusOK, "Webhook deleted successfully", nil)
+}
+
+func (h *WebhookHandler) GetDeliveries(w http.ResponseWriter, r *http.Request) {
+	webhookIDStr := chi.URLParam(r, "id")
+	if webhookIDStr == "" {
+		JsonResponse(w, http.StatusBadRequest, "Webhook ID is required", nil)
+		return
+	}
+
+	webhookID, err := uuid.Parse(webhookIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid webhook ID", err.Error())
+		return
+	}
+
+	webhook, err := webhookService.Get(webhookID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Webhook not found", err.Error())
+		return
+	}
+
+	user, err := GetUserFromContext(r.Context())
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
+		return
+	}
+
+	if webhook.UserID != user.ID {
+		JsonResponse(w, http.StatusForbidden, "You are not authorized to view deliveries for this webhook", nil)
+		return
+	}
+
+	limitStr := r.URL.Query().Get("limit")
+	offsetStr := r.URL.Query().Get("offset")
+
+	limit := 50 // Default limit
+	if limitStr != "" {
+		parsedLimit, err := strconv.Atoi(limitStr)
+		if err == nil && parsedLimit > 0 {
+			limit = parsedLimit
+			if limit > 100 {
+				limit = 100 // Max limit
+			}
+		}
+	}
+
+	offset := 0 // Default offset
+	if offsetStr != "" {
+		parsedOffset, err := strconv.Atoi(offsetStr)
+		if err == nil && parsedOffset >= 0 {
+			offset = parsedOffset
+		}
+	}
+
+	deliveries, err := webhookService.GetDeliveriesByWebhook(webhookID, limit, offset)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving webhook deliveries", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, "Webhook deliveries retrieved successfully", deliveries)
+}
+
+func (h *WebhookHandler) RetryDelivery(w http.ResponseWriter, r *http.Request) {
+	deliveryIDStr := chi.URLParam(r, "deliveryId")
+	if deliveryIDStr == "" {
+		JsonResponse(w, http.StatusBadRequest, "Delivery ID is required", nil)
+		return
+	}
+
+	deliveryID, err := uuid.Parse(deliveryIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid delivery ID", err.Error())
+		return
+	}
+
+	delivery, err := webhookService.GetDelivery(deliveryID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Webhook delivery not found", err.Error())
+		return
+	}
+
+	webhook, err := webhookService.Get(delivery.WebhookID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Webhook not found", err.Error())
+		return
+	}
+
+	user, err := GetUserFromContext(r.Context())
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
+		return
+	}
+
+	if webhook.UserID != user.ID {
+		JsonResponse(w, http.StatusForbidden, "You are not authorized to retry this webhook delivery", nil)
+		return
+	}
+
+	newDelivery, err := webhookService.RetryDelivery(deliveryID)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrying webhook delivery", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, "Webhook delivery retry initiated", newDelivery)
 }
 
 func init() {
