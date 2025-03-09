@@ -107,6 +107,11 @@ func InitRoutes() http.Handler {
 			r.Delete("/{id}", paymentLinkHandler.Delete)
 			r.Get("/account/{accountID}", paymentLinkHandler.ListByAccount)
 		})
+
+		r.Route("/notification-settings", func(r chi.Router) {
+			r.Get("/account/{accountId}", notificationHandler.GetSettings)
+			r.Post("/", notificationHandler.UpdateSettings)
+		})
 	})
 
 	return r

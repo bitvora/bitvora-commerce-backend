@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip04"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -179,64 +180,101 @@ func (l *WalletListener) WaitForResponse(eventID string, timeout time.Duration) 
 }
 
 func (l *WalletListener) handleEvent(event nostr.Event) {
+	// Find request ID
+	var requestID string
 	for _, tag := range event.Tags {
 		if len(tag) >= 2 && tag[0] == "e" {
-			requestID := tag[1]
-			if promiseInterface, exists := l.pendingRequests.Load(requestID); exists {
-				if promise, ok := promiseInterface.(*ResponsePromise); ok {
-					for _, ptag := range event.Tags {
-						if len(ptag) >= 2 && ptag[0] == "p" {
-							targetPubkey := ptag[1]
-							if walletInterface, found := l.walletPubkeyCache.Load(targetPubkey); found {
-								wallet, ok := walletInterface.(*WalletConnection)
-								if ok {
-									decryptedContent, err := l.decryptEventContent(wallet, event)
-									fmt.Println("Decrypted content", decryptedContent)
-									if err == nil {
-
-										var paymentResponse struct {
-											Result struct {
-												PaymentHash string `json:"payment_hash"`
-												Amount      int64  `json:"amount_msat"`
-												Preimage    string `json:"preimage"`
-												Invoice     string `json:"invoice,omitempty"`
-											} `json:"result"`
-											Error *struct{} `json:"error,omitempty"`
-										}
-
-										if err := json.Unmarshal([]byte(decryptedContent), &paymentResponse); err == nil && paymentResponse.Error == nil {
-
-											checkouts := []*Checkout{}
-											err := db.Select(&checkouts, "SELECT * FROM checkouts WHERE lightning_invoice=$1 AND state=$2",
-												paymentResponse.Result.Invoice, CheckoutStateOpen)
-
-											if err == nil && len(checkouts) > 0 {
-												for _, checkout := range checkouts {
-													newState := CheckoutStatePaid
-													receivedAmount := paymentResponse.Result.Amount
-
-													if receivedAmount < checkout.Amount {
-														newState = CheckoutStateUnderpaid
-													} else if receivedAmount > checkout.Amount {
-														newState = CheckoutStateOverpaid
-													}
-
-													checkoutService.UpdateState(checkout.ID, newState, receivedAmount)
-												}
-											}
-
-											promise.Response <- []byte(decryptedContent)
-											return
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
+			requestID = tag[1]
+			break
 		}
 	}
+	if requestID == "" {
+		return // No request ID found
+	}
+
+	// Get the promise from pending requests
+	promiseInterface, exists := l.pendingRequests.Load(requestID)
+	if !exists {
+		return // No pending request found
+	}
+
+	promise, ok := promiseInterface.(*ResponsePromise)
+	if !ok {
+		return // Invalid promise type
+	}
+
+	// Find target pubkey
+	var targetPubkey string
+	for _, ptag := range event.Tags {
+		if len(ptag) >= 2 && ptag[0] == "p" {
+			targetPubkey = ptag[1]
+			break
+		}
+	}
+	if targetPubkey == "" {
+		return // No target pubkey found
+	}
+
+	// Get wallet from cache
+	walletInterface, found := l.walletPubkeyCache.Load(targetPubkey)
+	if !found {
+		return // Wallet not found
+	}
+
+	wallet, ok := walletInterface.(*WalletConnection)
+	if !ok {
+		return // Invalid wallet type
+	}
+
+	// Decrypt event content
+	decryptedContent, err := l.decryptEventContent(wallet, event)
+	if err != nil {
+		return // Failed to decrypt content
+	}
+
+	log.Info("handling event", decryptedContent)
+
+	// Parse payment response
+	var paymentResponse struct {
+		Result struct {
+			PaymentHash string `json:"payment_hash"`
+			Amount      int64  `json:"amount_msat"`
+			Preimage    string `json:"preimage"`
+			Invoice     string `json:"invoice,omitempty"`
+		} `json:"result"`
+		Error *struct{} `json:"error,omitempty"`
+	}
+
+	if err := json.Unmarshal([]byte(decryptedContent), &paymentResponse); err != nil {
+		return // Failed to parse JSON
+	}
+
+	if paymentResponse.Error != nil {
+		return // Payment error
+	}
+
+	// Process checkouts
+	checkouts := []*Checkout{}
+	err = db.Select(&checkouts, "SELECT * FROM checkouts WHERE lightning_invoice=$1 AND state=$2",
+		paymentResponse.Result.Invoice, CheckoutStateOpen)
+
+	if err == nil && len(checkouts) > 0 {
+		for _, checkout := range checkouts {
+			newState := CheckoutStatePaid
+			receivedAmount := paymentResponse.Result.Amount
+
+			if receivedAmount < checkout.Amount {
+				newState = CheckoutStateUnderpaid
+			} else if receivedAmount > checkout.Amount {
+				newState = CheckoutStateOverpaid
+			}
+
+			checkoutService.UpdateState(checkout.ID, newState, receivedAmount)
+		}
+	}
+
+	// Send response back
+	promise.Response <- []byte(decryptedContent)
 }
 
 func (r *WalletRepository) Create(wallet *WalletConnection) (*WalletConnection, error) {
@@ -1043,8 +1081,6 @@ func (s *WalletService) MakeChainAddress(walletID uuid.UUID) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to encrypt content: %w", err)
 	}
-
-	fmt.Println("Encrypted content", string(requestJSON))
 
 	event := nostr.Event{
 		Kind:      nostr.KindNWCWalletRequest,
