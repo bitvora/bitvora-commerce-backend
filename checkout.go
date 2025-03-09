@@ -10,7 +10,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
-	"github.com/sirupsen/logrus"
 )
 
 type CheckoutState string
@@ -539,13 +538,7 @@ func (h *CheckoutHandler) PollInvoice(w http.ResponseWriter, r *http.Request) {
 	// Look for our invoice in the transactions
 	var matchingTransaction *Transaction
 	for i, tx := range response.Result.Transactions {
-		jsonTx, _ := json.Marshal(tx)
-		checkout.LightningInvoice = &tx.Invoice
-		logrus.Info("transaction", string(jsonTx))
-		logrus.Info("checkout.LightningInvoice", *checkout.LightningInvoice)
-
 		if tx.Invoice == *checkout.LightningInvoice {
-			logrus.Info("transaction", string(jsonTx))
 			matchingTransaction = &response.Result.Transactions[i]
 			break
 		}
