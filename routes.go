@@ -23,6 +23,9 @@ func InitRoutes() http.Handler {
 		AllowCredentials: true,
 	}))
 
+	// Add API Key middleware
+	// r.Use(APIKeyMiddleware)
+
 	r.Get("/", HandleHome)
 	r.Post("/register", userHandler.Register)
 	r.Post("/login", userHandler.Login)
@@ -39,6 +42,17 @@ func InitRoutes() http.Handler {
 		r.Get("/account", accountHandler.GetAll)
 		r.Get("/account/{id}", accountHandler.Get)
 		r.Delete("/account/{id}", accountHandler.Delete)
+
+		// API Key routes
+		r.Route("/api-key", func(r chi.Router) {
+			r.Post("/", apiKeyHandler.Create)
+			r.Get("/", apiKeyHandler.GetAll)
+			r.Get("/{id}", apiKeyHandler.Get)
+			r.Put("/{id}", apiKeyHandler.Update)
+			r.Delete("/{id}", apiKeyHandler.Delete)
+			r.Post("/{id}/lock", apiKeyHandler.Lock)
+			r.Get("/account/{accountId}", apiKeyHandler.GetByAccount)
+		})
 
 		r.Post("/product", productHandler.Create)
 		r.Put("/product/{id}", productHandler.Update)
