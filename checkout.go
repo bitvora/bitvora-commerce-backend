@@ -208,10 +208,16 @@ func (s *CheckoutService) Create(checkout *Checkout) (*Checkout, error) {
 	}
 
 	createdCheckout, err := checkoutRepository.Create(checkout)
-	if err == nil && createdCheckout != nil {
-		checkoutCache.Set(createdCheckout)
+	if err != nil {
+		return nil, err
 	}
-	return createdCheckout, err
+
+	checkoutCache.Set(createdCheckout)
+
+	// Deliver webhook for checkout creation
+	webhookService.DeliverWebhook(WebhookEventCheckoutCreated, createdCheckout.AccountID, createdCheckout)
+
+	return createdCheckout, nil
 }
 
 func (s *CheckoutService) Get(id uuid.UUID) (*Checkout, error) {
@@ -232,15 +238,41 @@ func (s *CheckoutService) UpdateState(id uuid.UUID, state CheckoutState, receive
 		return err
 	}
 
+	// Store the previous state to check if it changed
+	previousState := checkout.State
+
 	checkout.State = state
 	checkout.ReceivedAmount = receivedAmount
 	checkout.UpdatedAt = time.Now()
 
 	err = checkoutRepository.Update(checkout)
-	if err == nil {
-		checkoutCache.Set(checkout)
+	if err != nil {
+		return err
 	}
-	return err
+
+	checkoutCache.Set(checkout)
+
+	// If state changed, fire the appropriate webhook event
+	if previousState != state {
+		var event WebhookEvent
+
+		switch state {
+		case CheckoutStatePaid:
+			event = WebhookEventCheckoutPaid
+		case CheckoutStateUnderpaid:
+			event = WebhookEventCheckoutUnderpaid
+		case CheckoutStateOverpaid:
+			event = WebhookEventCheckoutOverpaid
+		case CheckoutStateExpired:
+			event = WebhookEventCheckoutExpired
+		}
+
+		if event != "" {
+			webhookService.DeliverWebhook(event, checkout.AccountID, checkout)
+		}
+	}
+
+	return nil
 }
 
 func (s *CheckoutService) GetByUser(userID uuid.UUID) ([]*Checkout, error) {
