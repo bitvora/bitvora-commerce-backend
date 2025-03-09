@@ -189,17 +189,20 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 		}
 	}
 	if requestID == "" {
+		logrus.Info("no request ID found", event.ID)
 		return // No request ID found
 	}
 
 	// Get the promise from pending requests
 	promiseInterface, exists := l.pendingRequests.Load(requestID)
 	if !exists {
+		logrus.Info("no pending request found", event.ID)
 		return // No pending request found
 	}
 
 	promise, ok := promiseInterface.(*ResponsePromise)
 	if !ok {
+		logrus.Info("invalid promise type", event.ID)
 		return // Invalid promise type
 	}
 
@@ -212,12 +215,14 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 		}
 	}
 	if targetPubkey == "" {
+		logrus.Info("no target pubkey found", event.ID)
 		return // No target pubkey found
 	}
 
 	// Get wallet from cache
 	walletInterface, found := l.walletPubkeyCache.Load(targetPubkey)
 	if !found {
+		logrus.Info("wallet not found", targetPubkey)
 		return // Wallet not found
 	}
 
