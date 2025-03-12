@@ -19,8 +19,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip04"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/exp/slog"
 )
 
 var (
@@ -180,6 +180,9 @@ func (l *WalletListener) WaitForResponse(eventID string, timeout time.Duration) 
 }
 
 func (l *WalletListener) handleEvent(event nostr.Event) {
+	// Log the received event
+	slog.Debug("Received event", "event_id", event.ID, "pubkey", event.PubKey, "content", event.Content)
+
 	// Find request ID
 	var requestID string
 	for _, tag := range event.Tags {
@@ -189,17 +192,20 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 		}
 	}
 	if requestID == "" {
+		slog.Warn("No request ID found in event", "event_id", event.ID)
 		return // No request ID found
 	}
 
 	// Get the promise from pending requests
 	promiseInterface, exists := l.pendingRequests.Load(requestID)
 	if !exists {
+		slog.Warn("No pending request found for request ID", "request_id", requestID)
 		return // No pending request found
 	}
 
 	promise, ok := promiseInterface.(*ResponsePromise)
 	if !ok {
+		slog.Error("Invalid promise type for request ID", "request_id", requestID)
 		return // Invalid promise type
 	}
 
@@ -212,27 +218,31 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 		}
 	}
 	if targetPubkey == "" {
+		slog.Warn("No target pubkey found in event", "event_id", event.ID)
 		return // No target pubkey found
 	}
 
 	// Get wallet from cache
 	walletInterface, found := l.walletPubkeyCache.Load(targetPubkey)
 	if !found {
+		slog.Warn("Wallet not found in cache for target pubkey", "target_pubkey", targetPubkey)
 		return // Wallet not found
 	}
 
 	wallet, ok := walletInterface.(*WalletConnection)
 	if !ok {
+		slog.Error("Invalid wallet type for target pubkey", "target_pubkey", targetPubkey)
 		return // Invalid wallet type
 	}
 
 	// Decrypt event content
 	decryptedContent, err := l.decryptEventContent(wallet, event)
 	if err != nil {
+		slog.Error("Failed to decrypt event content", "event_id", event.ID, "error", err)
 		return // Failed to decrypt content
 	}
 
-	logrus.Info("got event", event.ID, decryptedContent)
+	slog.Info("Decrypted event content", "event_id", event.ID, "decrypted_content", decryptedContent)
 	// Parse payment response
 	var paymentResponse struct {
 		Result struct {
@@ -245,10 +255,12 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 	}
 
 	if err := json.Unmarshal([]byte(decryptedContent), &paymentResponse); err != nil {
+		slog.Error("Failed to parse JSON from decrypted content", "event_id", event.ID, "error", err)
 		return // Failed to parse JSON
 	}
 
 	if paymentResponse.Error != nil {
+		slog.Warn("Payment error received", "event_id", event.ID, "error", paymentResponse.Error)
 		return // Payment error
 	}
 
@@ -269,6 +281,7 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 			}
 
 			checkoutService.UpdateState(checkout.ID, newState, receivedAmount)
+			slog.Info("Updated checkout state", "checkout_id", checkout.ID, "new_state", newState, "received_amount", receivedAmount)
 		}
 	}
 
@@ -384,7 +397,11 @@ func (s *WalletService) Create(wallet *WalletConnection) (*WalletConnection, err
 	wallet.CreatedAt = time.Now()
 	wallet.UpdatedAt = time.Now()
 
-	derivedPubkey, err := nostr.GetPublicKey(wallet.NostrSecret)
+	// Save the original plaintext secret before ANY processing
+	plainTextSecret := wallet.NostrSecret
+
+	// Derive pubkey from the plaintext secret (not the potentially encrypted one)
+	derivedPubkey, err := nostr.GetPublicKey(plainTextSecret)
 	if err != nil {
 		return nil, fmt.Errorf("failed to derive public key from secret: %w", err)
 	}
@@ -395,13 +412,15 @@ func (s *WalletService) Create(wallet *WalletConnection) (*WalletConnection, err
 		return nil, err
 	}
 
+	// createdWallet has the encrypted secret after this call
 	createdWallet, err := walletRepository.Create(wallet)
 	if err == nil && createdWallet != nil {
+		// Replace the encrypted secret with the plaintext secret for caching
+		createdWallet.NostrSecret = plainTextSecret
 		walletCache.Set(createdWallet)
-		if walletListener != nil {
-			walletListener.walletPubkeyCache.Store(createdWallet.NostrPubkey, createdWallet)
-			walletListener.walletPubkeyCache.Store(createdWallet.SecretPubkey, createdWallet)
-		}
+
+		// Now add the wallet to the listener with the proper plaintext secret
+		walletListener.AddWallet(createdWallet)
 	}
 	return createdWallet, err
 }
@@ -449,6 +468,7 @@ func (s *WalletService) GetActiveWalletByAccount(accountID uuid.UUID) (*WalletCo
 		}
 	}
 
+	slog.Info("no active wallet found", "account_id", accountID)
 	return nil, fmt.Errorf("no active wallet found")
 }
 
@@ -787,41 +807,70 @@ func (l *WalletListener) Stop() {
 }
 
 func (l *WalletListener) SubscribeToRelays(relayURLs []string) {
-	ctx, cancel := context.WithCancel(l.ctx)
+	// Subscribe to each relay individually to have better tracking
+	for _, relay := range relayURLs {
+		relayKey := fmt.Sprintf("relay:%s", relay)
+		_, isSubscribed := l.connections.Load(relayKey)
 
-	walletKinds := []int{
-		nostr.KindNWCWalletInfo,
-		nostr.KindNWCWalletRequest,
-		nostr.KindNWCWalletResponse,
-	}
+		if !isSubscribed {
+			slog.Info("Subscribing to relay from list", "relay", relay)
 
-	since := nostr.Timestamp(time.Now().Unix())
-	filters := nostr.Filter{
-		Kinds: walletKinds,
-		Since: &since,
-	}
+			go func(relayURL string) {
+				ctx, cancel := context.WithCancel(l.ctx)
+				l.connections.Store(fmt.Sprintf("relay:%s", relayURL), cancel)
 
-	sub := l.pool.SubscribeMany(ctx, relayURLs, filters)
+				walletKinds := []int{
+					nostr.KindNWCWalletInfo,
+					nostr.KindNWCWalletRequest,
+					nostr.KindNWCWalletResponse,
+				}
 
-	l.connections.Store("all_relays", cancel)
+				since := nostr.Timestamp(time.Now().Unix())
+				filters := nostr.Filter{
+					Kinds: walletKinds,
+					Since: &since,
+				}
 
-	go func() {
-		for event := range sub {
-			if event.Event == nil {
-				continue
-			}
+				sub := l.pool.SubscribeMany(ctx, []string{relayURL}, filters)
 
-			l.handleEvent(*event.Event)
+				for event := range sub {
+					if event.Event == nil {
+						continue
+					}
+
+					l.handleEvent(*event.Event)
+				}
+
+				slog.Info("Relay subscription ended", "relay", relayURL)
+			}(relay)
 		}
-
-		l.connections.Delete("all_relays")
-	}()
+	}
 }
 
 func (l *WalletListener) decryptEventContent(wallet *WalletConnection, event nostr.Event) (string, error) {
-	walletPrivateKey, err := decrypt(wallet.NostrSecret)
-	if err != nil {
-		return "", fmt.Errorf("failed to decrypt wallet secret: %w", err)
+	slog.Debug("Attempting to decrypt event content",
+		"event_id", event.ID,
+		"wallet_id", wallet.ID,
+		"wallet_pubkey", wallet.NostrPubkey,
+		"secret_length", len(wallet.NostrSecret))
+
+	// Use the wallet secret directly - we assume it's already in plaintext form in the cache
+	var walletPrivateKey string
+
+	// Try to determine if the secret is already plaintext
+	// A valid nostr private key is 64 chars hex or 32 bytes raw
+	if len(wallet.NostrSecret) == 64 || len(wallet.NostrSecret) == 32 {
+		// Likely already plaintext
+		slog.Debug("Using wallet secret directly - appears to be plaintext already", "event_id", event.ID)
+		walletPrivateKey = wallet.NostrSecret
+	} else {
+		// Try to decrypt it
+		var err error
+		walletPrivateKey, err = decrypt(wallet.NostrSecret)
+		if err != nil {
+			return "", fmt.Errorf("failed to decrypt wallet secret: %w", err)
+		}
+		slog.Debug("Successfully decrypted wallet secret", "event_id", event.ID)
 	}
 
 	sharedSecret, err := nip04.ComputeSharedSecret(event.PubKey, walletPrivateKey)
@@ -838,9 +887,17 @@ func (l *WalletListener) decryptEventContent(wallet *WalletConnection, event nos
 }
 
 func (l *WalletListener) encryptEventContent(wallet *WalletConnection, recipientPubkey, content string) (string, error) {
-	walletPrivateKey, err := decrypt(wallet.NostrSecret)
-	if err != nil {
-		return "", fmt.Errorf("failed to decrypt wallet secret: %w", err)
+	// Same logic as in decryptEventContent
+	var walletPrivateKey string
+
+	if len(wallet.NostrSecret) == 64 || len(wallet.NostrSecret) == 32 {
+		walletPrivateKey = wallet.NostrSecret
+	} else {
+		var err error
+		walletPrivateKey, err = decrypt(wallet.NostrSecret)
+		if err != nil {
+			return "", fmt.Errorf("failed to decrypt wallet secret: %w", err)
+		}
 	}
 
 	sharedSecret, err := nip04.ComputeSharedSecret(recipientPubkey, walletPrivateKey)
@@ -1219,5 +1276,66 @@ func (s *WalletService) ListTransactions(walletID uuid.UUID, from, until int64, 
 		pool := nostr.NewSimplePool(ctx)
 		pool.PublishMany(ctx, []string{wallet.NostrRelay}, event)
 		return nil, fmt.Errorf("wallet listener not initialized, cannot wait for response")
+	}
+}
+
+func (l *WalletListener) AddWallet(wallet *WalletConnection) {
+	// Log what we're doing
+	slog.Info("Adding wallet to listener cache",
+		"wallet_id", wallet.ID,
+		"pubkey", wallet.NostrPubkey,
+		"relay", wallet.NostrRelay)
+
+	// Add to pubkey cache - use the wallet as-is (assuming it has plaintext secret)
+	l.walletPubkeyCache.Store(wallet.NostrPubkey, wallet)
+	l.walletPubkeyCache.Store(wallet.SecretPubkey, wallet)
+
+	// Use a predictable format for relay keys
+	relayKey := fmt.Sprintf("relay:%s", wallet.NostrRelay)
+
+	// Check if we're already subscribed using the proper key format
+	_, isSubscribed := l.connections.Load(relayKey)
+
+	// If not already subscribed, add subscription to the relay
+	if !isSubscribed {
+		slog.Info("Subscribing to relay", "relay", wallet.NostrRelay, "relay_key", relayKey)
+
+		// Create subscription in a goroutine
+		go func() {
+			ctx, cancel := context.WithCancel(l.ctx)
+
+			// Store the cancel function with a consistent key before starting the subscription
+			l.connections.Store(relayKey, cancel)
+
+			walletKinds := []int{
+				nostr.KindNWCWalletInfo,
+				nostr.KindNWCWalletRequest,
+				nostr.KindNWCWalletResponse,
+			}
+
+			since := nostr.Timestamp(time.Now().Unix())
+			filters := nostr.Filter{
+				Kinds: walletKinds,
+				Since: &since,
+			}
+
+			// Subscribe only to this specific relay
+			sub := l.pool.SubscribeMany(ctx, []string{wallet.NostrRelay}, filters)
+
+			slog.Debug("Started relay subscription", "relay", wallet.NostrRelay)
+
+			for event := range sub {
+				if event.Event == nil {
+					continue
+				}
+
+				l.handleEvent(*event.Event)
+			}
+
+			slog.Info("Relay subscription ended", "relay", wallet.NostrRelay)
+			// Don't delete the connection here - only when explicitly unsubscribing
+		}()
+	} else {
+		slog.Debug("Already subscribed to relay", "relay", wallet.NostrRelay, "relay_key", relayKey)
 	}
 }
