@@ -9,7 +9,8 @@ CREATE TABLE wallet_connections (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     expired_at TIMESTAMP,
-    deleted_at TIMESTAMP
+    deleted_at TIMESTAMP,
+    methods JSONB DEFAULT '[]'
 );
 
 CREATE INDEX wallet_connections_user_id_idx ON wallet_connections(user_id);
