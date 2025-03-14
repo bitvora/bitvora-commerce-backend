@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/joho/godotenv"
 )
 
 // Declare a global logger variable
 var logger *slog.Logger
+var fiatRateService *FiatRateService
+var fiatHandler *FiatHandler
 
 func main() {
 	err := godotenv.Load()
@@ -25,6 +28,13 @@ func main() {
 	webhookService = NewWebhookService()
 	checkoutService = NewCheckoutService()
 	walletService = &WalletService{}
+
+	// Initialize the fiat rate service and handler
+	fiatRateService = NewFiatRateService()
+	fiatHandler = &FiatHandler{
+		Validator: validator.New(),
+		Service:   fiatRateService,
+	}
 
 	InitDB()
 	r := InitRoutes()

@@ -114,6 +114,12 @@ func InitRoutes() http.Handler {
 			r.Get("/account/{accountId}", notificationHandler.GetSettings)
 			r.Post("/", notificationHandler.UpdateSettings)
 		})
+
+		r.Route("/fiat", func(r chi.Router) {
+			r.Get("/rates", fiatHandler.GetRates)
+			r.Get("/convert/to-fiat/{currency}", fiatHandler.ConvertSatoshisToFiat)
+			r.Get("/convert/to-sats/{currency}", fiatHandler.ConvertFiatToSatoshis)
+		})
 	})
 
 	return r
