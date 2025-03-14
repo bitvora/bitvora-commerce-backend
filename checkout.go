@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -23,12 +24,20 @@ const (
 	CheckoutStateExpired             CheckoutState = "expired"
 )
 
+type CheckoutType string
+
+const (
+	CheckoutTypeSingle       CheckoutType = "single"       // One-time payment
+	CheckoutTypeSubscription CheckoutType = "subscription" // Recurring subscription
+)
+
 type Checkout struct {
 	ID               uuid.UUID        `db:"id" json:"id"`
 	UserID           uuid.UUID        `db:"user_id" json:"user_id"`
 	AccountID        uuid.UUID        `db:"account_id" json:"account_id"`
 	CustomerID       *uuid.UUID       `db:"customer_id" json:"customer_id,omitempty"`
 	SubscriptionID   *uuid.UUID       `db:"subscription_id" json:"subscription_id,omitempty"`
+	Type             CheckoutType     `db:"type" json:"type"`
 	State            CheckoutState    `db:"state" json:"state"`
 	Amount           int64            `db:"amount" json:"amount"`
 	ReceivedAmount   int64            `db:"received_amount" json:"received_amount"`
@@ -40,6 +49,7 @@ type Checkout struct {
 	CreatedAt        time.Time        `db:"created_at" json:"created_at"`
 	UpdatedAt        time.Time        `db:"updated_at" json:"updated_at"`
 	DeletedAt        *time.Time       `db:"deleted_at" json:"deleted_at,omitempty"`
+	ProductID        *uuid.UUID       `db:"product_id" json:"product_id,omitempty"`
 }
 
 type CheckoutCache struct {
@@ -71,15 +81,15 @@ func (r *CheckoutRepository) Create(checkout *Checkout) (*Checkout, error) {
 	err := db.Get(checkout, `
 		INSERT INTO checkouts (
 			id, user_id, account_id, customer_id, subscription_id,
-			state, amount, received_amount, lightning_invoice, bitcoin_address,
+			product_id, type, state, amount, received_amount, lightning_invoice, bitcoin_address,
 			metadata, items, expires_at, created_at, updated_at, deleted_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
-			$6, $7, $8, $9, $10,
-			$11, $12, $13, $14, $15, $16
+			$6, $7, $8, $9, $10, $11,
+			$12, $13, $14, $15, $16, $17, $18
 		) RETURNING *`,
 		checkout.ID, checkout.UserID, checkout.AccountID, checkout.CustomerID, checkout.SubscriptionID,
-		checkout.State, checkout.Amount, checkout.ReceivedAmount, checkout.LightningInvoice, checkout.BitcoinAddress,
+		checkout.ProductID, checkout.Type, checkout.State, checkout.Amount, checkout.ReceivedAmount, checkout.LightningInvoice, checkout.BitcoinAddress,
 		checkout.Metadata, checkout.Items, checkout.ExpiresAt, checkout.CreatedAt, checkout.UpdatedAt, checkout.DeletedAt)
 	return checkout, err
 }
@@ -105,9 +115,11 @@ func (r *CheckoutRepository) GetByAccount(accountID uuid.UUID) ([]*Checkout, err
 func (r *CheckoutRepository) Update(checkout *Checkout) error {
 	_, err := db.Exec(`
 		UPDATE checkouts SET 
-			state=$1, received_amount=$2, updated_at=$3
-		WHERE id=$4`,
-		checkout.State, checkout.ReceivedAmount, checkout.UpdatedAt, checkout.ID)
+			type=$1, state=$2, received_amount=$3, lightning_invoice=$4, bitcoin_address=$5,
+			updated_at=$6
+		WHERE id=$7`,
+		checkout.Type, checkout.State, checkout.ReceivedAmount, checkout.LightningInvoice, checkout.BitcoinAddress,
+		checkout.UpdatedAt, checkout.ID)
 	return err
 }
 
@@ -196,18 +208,32 @@ func (s *CheckoutService) Create(checkout *Checkout) (*Checkout, error) {
 	checkout.UpdatedAt = time.Now()
 	checkout.State = CheckoutStateOpen
 
-	if wallet, err := walletService.GetActiveWalletByAccount(checkout.AccountID); err == nil {
-		expirySeconds := int64(30 * 60)
-		description := fmt.Sprintf("Checkout #%s", checkout.ID.String())
+	// Set default type if not specified
+	if checkout.Type == "" {
+		checkout.Type = CheckoutTypeSingle
+	}
 
-		invoice, err := walletService.MakeInvoice(wallet.ID, checkout.Amount, description, expirySeconds)
-		if err == nil {
-			checkout.LightningInvoice = &invoice
-		}
+	// For single checkouts, automatically create a lightning invoice and bitcoin address
+	if checkout.Type == CheckoutTypeSingle {
+		if wallet, err := walletService.GetActiveWalletByAccount(checkout.AccountID); err == nil {
+			expirySeconds := int64(30 * 60)
+			description := fmt.Sprintf("Checkout #%s", checkout.ID.String())
 
-		chainAddress, err := walletService.MakeChainAddress(wallet.ID)
-		if err == nil {
-			checkout.BitcoinAddress = &chainAddress
+			invoice, err := walletService.MakeInvoice(wallet.ID, checkout.Amount, description, expirySeconds)
+			if err == nil {
+				checkout.LightningInvoice = &invoice
+			}
+
+			// wallet.Methods is a json.RawMessage, we need to get it into an array of strings
+			walletMethods := []string{}
+			if err := json.Unmarshal(wallet.Methods, &walletMethods); err == nil {
+				if slices.Contains(walletMethods, "make_chain_address") {
+					chainAddress, err := walletService.MakeChainAddress(wallet.ID)
+					if err == nil {
+						checkout.BitcoinAddress = &chainAddress
+					}
+				}
+			}
 		}
 	}
 
@@ -313,6 +339,8 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		AccountID      uuid.UUID        `json:"account_id" validate:"required"`
 		CustomerID     *uuid.UUID       `json:"customer_id"`
 		SubscriptionID *uuid.UUID       `json:"subscription_id"`
+		ProductID      *uuid.UUID       `json:"product_id"`
+		Type           CheckoutType     `json:"type"`
 		Amount         int64            `json:"amount" validate:"required,min=1"`
 		Metadata       *json.RawMessage `json:"metadata"`
 		Items          *json.RawMessage `json:"items"`
@@ -326,6 +354,14 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.Validator.Struct(input); err != nil {
 		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	// Validate checkout type
+	if input.Type != "" &&
+		input.Type != CheckoutTypeSingle &&
+		input.Type != CheckoutTypeSubscription {
+		JsonResponse(w, http.StatusBadRequest, "Invalid checkout type", nil)
 		return
 	}
 
@@ -360,6 +396,11 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if input.SubscriptionID != nil {
+		if input.ProductID == nil {
+			JsonResponse(w, http.StatusBadRequest, "Subscription ID provided but no product ID", nil)
+			return
+		}
+
 		subscription, err := subscriptionService.Get(*input.SubscriptionID)
 		if err != nil {
 			JsonResponse(w, http.StatusNotFound, "Subscription not found", err.Error())
@@ -372,7 +413,7 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	expiryMinutes := 1440
+	expiryMinutes := 1440 // 24 hours
 	if input.ExpiryMinutes > 0 {
 		expiryMinutes = input.ExpiryMinutes
 	}
@@ -383,10 +424,12 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		AccountID:      input.AccountID,
 		CustomerID:     input.CustomerID,
 		SubscriptionID: input.SubscriptionID,
+		Type:           input.Type,
 		Amount:         input.Amount,
 		Metadata:       input.Metadata,
 		Items:          input.Items,
 		ExpiresAt:      time.Now().Add(time.Duration(expiryMinutes) * time.Minute),
+		ProductID:      input.ProductID,
 	}
 
 	createdCheckout, err := checkoutService.Create(checkout)
@@ -590,9 +633,254 @@ func (h *CheckoutHandler) PollInvoice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ConnectWallet handles a user connecting their wallet to a checkout for subscription payments
+func (h *CheckoutHandler) ConnectWallet(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid checkout ID", err.Error())
+		return
+	}
+
+	checkout, err := checkoutService.Get(id)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Checkout not found", err.Error())
+		return
+	}
+
+	// Verify the checkout is still open
+	if checkout.State != CheckoutStateOpen {
+		JsonResponse(w, http.StatusBadRequest, "Checkout is not in open state", nil)
+		return
+	}
+
+	var input struct {
+		WalletConnect string `json:"wallet_connect" validate:"required"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	if err := h.Validator.Struct(input); err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	// Parse the wallet connect string
+	parsedWallet, err := parseWalletConnectString(input.WalletConnect)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid wallet connection string", err.Error())
+		return
+	}
+
+	// Verify this wallet supports necessary methods
+	info, err := walletService.GetInfo(parsedWallet.NostrPubkey, parsedWallet.NostrSecret, parsedWallet.NostrRelay)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Failed to connect to wallet", err.Error())
+		return
+	}
+
+	var infoResponse struct {
+		ResultType string `json:"result_type"`
+		Result     struct {
+			Methods []string `json:"methods"`
+		} `json:"result"`
+	}
+
+	if err := json.Unmarshal(info, &infoResponse); err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Failed to parse wallet info", err.Error())
+		return
+	}
+
+	// Check if wallet supports pay_invoice
+	if !slices.Contains(infoResponse.Result.Methods, "pay_invoice") {
+		JsonResponse(w, http.StatusBadRequest, "Wallet does not support pay_invoice method", nil)
+		return
+	}
+
+	// Get the account's active wallet
+	sellerWallet, err := walletService.GetActiveWalletByAccount(checkout.AccountID)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Failed to get merchant wallet", err.Error())
+		return
+	}
+
+	// create a customer if one doesn't exist
+	if checkout.CustomerID == nil {
+		customer := &Customer{
+			ID:        uuid.New(),
+			UserID:    checkout.UserID,
+			AccountID: checkout.AccountID,
+		}
+
+		customer, err := customerService.Create(customer)
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Failed to create customer", err.Error())
+			return
+		}
+
+		checkout.CustomerID = &customer.ID
+	}
+
+	// Create invoice for the initial payment
+	expirySeconds := int64(30 * 60)
+	description := fmt.Sprintf("Subscription checkout #%s", checkout.ID.String())
+	invoice, err := walletService.MakeInvoice(sellerWallet.ID, checkout.Amount, description, expirySeconds)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Failed to create invoice", err.Error())
+		return
+	}
+
+	// Update checkout with the invoice
+	checkout.LightningInvoice = &invoice
+	checkout.UpdatedAt = time.Now()
+	err = checkoutRepository.Update(checkout)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Failed to update checkout", err.Error())
+		return
+	}
+
+	// Try to pay the invoice from customer's wallet
+	err = walletService.PayInvoiceWithConnection(parsedWallet.NostrPubkey, parsedWallet.NostrSecret, parsedWallet.NostrRelay, invoice)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Failed to pay invoice", err.Error())
+		return
+	}
+
+	// Start polling for payment confirmation
+	go func() {
+		// Poll up to 10 times with 3 second intervals
+		for i := 0; i < 10; i++ {
+			logger.Info("Polling for payment confirmation", "checkout_id", checkout.ID)
+			time.Sleep(3 * time.Second)
+
+			updatedCheckout, err := checkoutService.Get(checkout.ID)
+			if err != nil {
+				continue
+			}
+
+			if updatedCheckout.State == CheckoutStatePaid || updatedCheckout.State == CheckoutStateOverpaid {
+				processSubscriptionCreation(updatedCheckout, parsedWallet)
+				break
+			}
+
+			if updatedCheckout.LightningInvoice != nil && *updatedCheckout.LightningInvoice != "" {
+				responseData, err := walletService.ListTransactions(sellerWallet.ID, 0, 0, 50, 0, false, "incoming")
+				if err != nil {
+					logger.Error("Error listing transactions", "error", err)
+					continue
+				}
+
+				var response TransactionResponse
+				if err := json.Unmarshal(responseData, &response); err != nil {
+					continue
+				}
+
+				if response.Error != nil {
+					continue
+				}
+
+				// Look for our invoice in the transactions
+				for _, tx := range response.Result.Transactions {
+					if tx.Invoice == *updatedCheckout.LightningInvoice && tx.SettledAt != nil && tx.Preimage != "" {
+						// Invoice has been paid, update the checkout state
+						newState := CheckoutStatePaid
+						receivedAmount := tx.Amount
+
+						if receivedAmount < updatedCheckout.Amount {
+							newState = CheckoutStateUnderpaid
+						} else if receivedAmount > updatedCheckout.Amount {
+							newState = CheckoutStateOverpaid
+						}
+
+						err = checkoutService.UpdateState(updatedCheckout.ID, newState, receivedAmount)
+						if err == nil && (newState == CheckoutStatePaid || newState == CheckoutStateOverpaid) {
+							// Fetch the updated checkout and create the subscription
+							if latestCheckout, err := checkoutService.Get(updatedCheckout.ID); err == nil {
+								processSubscriptionCreation(latestCheckout, parsedWallet)
+							}
+						}
+						return // Exit the goroutine as we've handled the payment
+					}
+				}
+			}
+		}
+	}()
+
+	JsonResponse(w, http.StatusOK, "Payment initiated successfully", checkout)
+}
+
+// Add this helper function after the ConnectWallet method to handle subscription creation
+func processSubscriptionCreation(checkout *Checkout, wallet *WalletConnection) {
+	if checkout.CustomerID == nil {
+		logger.Error("No customer ID found for checkout", "checkout_id", checkout.ID)
+		return
+	}
+
+	customerID := *checkout.CustomerID
+
+	// Check if the product ID exists
+	if checkout.ProductID == nil {
+		logger.Error("No product ID found for checkout", "checkout_id", checkout.ID)
+		return
+	}
+
+	_, err := productService.Get(*checkout.ProductID) // Assuming you have a productService to get product details
+	if err != nil {
+		logger.Error("Product not found", "product_id", checkout.ProductID, "checkout_id", checkout.ID)
+		return
+	}
+
+	var metadata json.RawMessage
+	if checkout.Metadata == nil {
+		metadata = json.RawMessage(`{}`)
+	} else {
+		metadata = *checkout.Metadata
+	}
+
+	subscription := &Subscription{
+		ID:               uuid.New(),
+		UserID:           checkout.UserID,
+		AccountID:        checkout.AccountID,
+		CustomerID:       customerID,
+		ProductID:        *checkout.ProductID, // Ensure ProductID is set
+		BillingStartDate: time.Now(),
+		ActiveOnDate:     time.Now(),
+		Metadata:         metadata,
+		NostrRelay:       &wallet.NostrRelay,
+		NostrPubkey:      &wallet.NostrPubkey,
+		NostrSecret:      &wallet.NostrSecret,
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
+	}
+
+	subscriptionSvc, err := subscriptionService.Create(subscription)
+	if err != nil {
+		logger.Error("Failed to create subscription", "error", err, "checkout_id", checkout.ID)
+		return
+	}
+
+	// Associate subscription with checkout
+	checkout.SubscriptionID = &subscriptionSvc.ID
+	checkout.UpdatedAt = time.Now()
+	checkoutRepository.Update(checkout)
+
+	logger.Info("Created subscription from checkout",
+		"checkout_id", checkout.ID,
+		"subscription_id", subscriptionSvc.ID)
+}
+
 func init() {
 	checkoutService = NewCheckoutService()
 }
 
 func IntegrateWithWalletListener() {
+}
+
+func SomeFunction() {
+	// ...
+	logger.Info("Some log message") // Use the global logger
+	// ...
 }

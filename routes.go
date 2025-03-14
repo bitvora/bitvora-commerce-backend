@@ -98,6 +98,7 @@ func InitRoutes() http.Handler {
 		r.Post("/invoice", walletHandler.MakeInvoice)
 		r.Post("/checkout", checkoutHandler.Create)
 		r.Get("/checkout/{id}", checkoutHandler.Get)
+		r.Post("/checkout/{id}/subscribe", checkoutHandler.ConnectWallet)
 		r.Get("/checkout/account/{accountId}", checkoutHandler.GetAllByAccount)
 
 		r.Route("/payment-link", func(r chi.Router) {
