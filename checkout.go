@@ -37,6 +37,7 @@ type Checkout struct {
 	AccountID        uuid.UUID        `db:"account_id" json:"account_id"`
 	CustomerID       *uuid.UUID       `db:"customer_id" json:"customer_id,omitempty"`
 	SubscriptionID   *uuid.UUID       `db:"subscription_id" json:"subscription_id,omitempty"`
+	ProductID        *uuid.UUID       `db:"product_id" json:"product_id,omitempty"`
 	Type             CheckoutType     `db:"type" json:"type"`
 	State            CheckoutState    `db:"state" json:"state"`
 	Amount           int64            `db:"amount" json:"amount"`
@@ -45,11 +46,11 @@ type Checkout struct {
 	BitcoinAddress   *string          `db:"bitcoin_address" json:"bitcoin_address,omitempty"`
 	Metadata         *json.RawMessage `db:"metadata" json:"metadata,omitempty"`
 	Items            *json.RawMessage `db:"items" json:"items,omitempty"`
+	Rates            json.RawMessage  `db:"rates" json:"rates,omitempty"`
 	ExpiresAt        time.Time        `db:"expires_at" json:"expires_at"`
 	CreatedAt        time.Time        `db:"created_at" json:"created_at"`
 	UpdatedAt        time.Time        `db:"updated_at" json:"updated_at"`
 	DeletedAt        *time.Time       `db:"deleted_at" json:"deleted_at,omitempty"`
-	ProductID        *uuid.UUID       `db:"product_id" json:"product_id,omitempty"`
 }
 
 type CheckoutCache struct {
@@ -82,15 +83,15 @@ func (r *CheckoutRepository) Create(checkout *Checkout) (*Checkout, error) {
 		INSERT INTO checkouts (
 			id, user_id, account_id, customer_id, subscription_id,
 			product_id, type, state, amount, received_amount, lightning_invoice, bitcoin_address,
-			metadata, items, expires_at, created_at, updated_at, deleted_at
+			metadata, items, rates, expires_at, created_at, updated_at, deleted_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10, $11,
-			$12, $13, $14, $15, $16, $17, $18
+			$12, $13, $14, $15, $16, $17, $18, $19
 		) RETURNING *`,
 		checkout.ID, checkout.UserID, checkout.AccountID, checkout.CustomerID, checkout.SubscriptionID,
 		checkout.ProductID, checkout.Type, checkout.State, checkout.Amount, checkout.ReceivedAmount, checkout.LightningInvoice, checkout.BitcoinAddress,
-		checkout.Metadata, checkout.Items, checkout.ExpiresAt, checkout.CreatedAt, checkout.UpdatedAt, checkout.DeletedAt)
+		checkout.Metadata, checkout.Items, checkout.Rates, checkout.ExpiresAt, checkout.CreatedAt, checkout.UpdatedAt, checkout.DeletedAt)
 	return checkout, err
 }
 
@@ -212,14 +213,13 @@ func (s *CheckoutService) Create(checkout *Checkout) (*Checkout, error) {
 	if checkout.Type == "" {
 		checkout.Type = CheckoutTypeSingle
 	}
-
 	// For single checkouts, automatically create a lightning invoice and bitcoin address
 	if checkout.Type == CheckoutTypeSingle {
 		if wallet, err := walletService.GetActiveWalletByAccount(checkout.AccountID); err == nil {
 			expirySeconds := int64(30 * 60)
 			description := fmt.Sprintf("Checkout #%s", checkout.ID.String())
-
-			invoice, err := walletService.MakeInvoice(wallet.ID, checkout.Amount, description, expirySeconds)
+			mSatAmount := checkout.Amount * 1000
+			invoice, err := walletService.MakeInvoice(wallet.ID, mSatAmount, description, expirySeconds)
 			if err == nil {
 				checkout.LightningInvoice = &invoice
 			}
@@ -335,16 +335,25 @@ var checkoutHandler = &CheckoutHandler{
 }
 
 func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
+	// amount and currency are optional if product_id is provided
 	var input struct {
 		AccountID      uuid.UUID        `json:"account_id" validate:"required"`
 		CustomerID     *uuid.UUID       `json:"customer_id"`
 		SubscriptionID *uuid.UUID       `json:"subscription_id"`
 		ProductID      *uuid.UUID       `json:"product_id"`
 		Type           CheckoutType     `json:"type"`
-		Amount         int64            `json:"amount" validate:"required,min=1"`
+		Amount         float64          `json:"amount" validate:"required_without=ProductID,gte=0"`
+		Currency       string           `json:"currency" validate:"required_without=ProductID"`
 		Metadata       *json.RawMessage `json:"metadata"`
 		Items          *json.RawMessage `json:"items"`
 		ExpiryMinutes  int              `json:"expiry_minutes"`
+	}
+
+	rates := fiatRateService.GetRates()
+	ratesJSON, err := json.Marshal(rates)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error marshalling rates", err.Error())
+		return
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
@@ -356,7 +365,6 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
 		return
 	}
-
 	// Validate checkout type
 	if input.Type != "" &&
 		input.Type != CheckoutTypeSingle &&
@@ -369,6 +377,32 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
 		return
+	}
+
+	// If there's a product ID associated, use its price and currency
+	if input.ProductID != nil {
+		product, err := productService.Get(*input.ProductID)
+		if err == nil {
+			input.Amount = product.Amount
+			input.Currency = product.Currency
+		}
+	}
+
+	var satsAmount int64
+	if input.Currency != "sats" && input.Currency != "btc" {
+		sats, err := fiatRateService.FiatToSatoshis(input.Amount, input.Currency)
+		if err != nil {
+			JsonResponse(w, http.StatusBadRequest, "Invalid currency", err.Error())
+			return
+		}
+
+		satsAmount = sats
+	} else {
+		if input.Currency == "btc" {
+			satsAmount = int64(input.Amount * 100000000)
+		} else {
+			satsAmount = int64(input.Amount)
+		}
 	}
 
 	account, err := accountService.Get(input.AccountID)
@@ -425,11 +459,12 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		CustomerID:     input.CustomerID,
 		SubscriptionID: input.SubscriptionID,
 		Type:           input.Type,
-		Amount:         input.Amount,
+		Amount:         satsAmount,
 		Metadata:       input.Metadata,
 		Items:          input.Items,
 		ExpiresAt:      time.Now().Add(time.Duration(expiryMinutes) * time.Minute),
 		ProductID:      input.ProductID,
+		Rates:          ratesJSON,
 	}
 
 	createdCheckout, err := checkoutService.Create(checkout)
@@ -596,7 +631,7 @@ func (h *CheckoutHandler) PollInvoice(w http.ResponseWriter, r *http.Request) {
 	if matchingTransaction.SettledAt != nil && matchingTransaction.Preimage != "" {
 		// Update checkout state
 		newState := CheckoutStatePaid
-		receivedAmount := matchingTransaction.Amount
+		receivedAmount := matchingTransaction.Amount / 1000
 
 		if receivedAmount < checkout.Amount {
 			newState = CheckoutStateUnderpaid

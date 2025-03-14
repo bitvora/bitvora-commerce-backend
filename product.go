@@ -18,8 +18,8 @@ type Product struct {
 	Description        *string    `db:"description" json:"description,omitempty"`
 	Image              *string    `db:"image" json:"image,omitempty"`
 	IsRecurring        bool       `db:"is_recurring" json:"is_recurring"`
-	Amount             float64    `db:"amount" json:"amount"`
-	Currency           string     `db:"currency" json:"currency"`
+	Amount             float64    `db:"amount" json:"amount"`     // Price amount
+	Currency           string     `db:"currency" json:"currency"` // Currency code
 	BillingPeriodHours *int       `db:"billing_period_hours" json:"billing_period_hours,omitempty"`
 	CreatedAt          time.Time  `db:"created_at" json:"created_at"`
 	UpdatedAt          time.Time  `db:"updated_at" json:"updated_at"`
@@ -128,7 +128,7 @@ func (h *ProductHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Image              *string   `json:"image,omitempty"`
 		IsRecurring        bool      `json:"is_recurring"`
 		Amount             float64   `json:"amount" validate:"required,gt=0"`
-		Currency           string    `json:"currency" validate:"required,len=3"`
+		Currency           string    `json:"currency" validate:"required"`
 		BillingPeriodHours *int      `json:"billing_period_hours,omitempty"`
 	}
 
@@ -139,6 +139,12 @@ func (h *ProductHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.Validator.Struct(input); err != nil {
 		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	// Validate currency (only 3-letter codes for fiat, or "btc"/"sats" for bitcoin)
+	if input.Currency != "btc" && input.Currency != "sats" && len(input.Currency) != 3 {
+		JsonResponse(w, http.StatusBadRequest, "Currency must be a 3-letter code or 'btc'/'sats'", nil)
 		return
 	}
 
@@ -164,6 +170,13 @@ func (h *ProductHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Normalize amounts for bitcoin currencies
+	amount := input.Amount
+	if input.Currency == "btc" {
+		// Convert to a more precise decimal representation for BTC
+		amount = input.Amount // Keep as is, will be interpreted as BTC
+	}
+
 	product := &Product{
 		ID:                 uuid.New(),
 		UserID:             user.ID,
@@ -172,7 +185,7 @@ func (h *ProductHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Description:        input.Description,
 		Image:              input.Image,
 		IsRecurring:        input.IsRecurring,
-		Amount:             input.Amount,
+		Amount:             amount,
 		Currency:           input.Currency,
 		BillingPeriodHours: input.BillingPeriodHours,
 	}
@@ -222,7 +235,7 @@ func (h *ProductHandler) Update(w http.ResponseWriter, r *http.Request) {
 		Image              *string `json:"image,omitempty"`
 		IsRecurring        bool    `json:"is_recurring"`
 		Amount             float64 `json:"amount" validate:"required,gt=0"`
-		Currency           string  `json:"currency" validate:"required,len=3"`
+		Currency           string  `json:"currency" validate:"required"`
 		BillingPeriodHours *int    `json:"billing_period_hours,omitempty"`
 	}
 
@@ -236,9 +249,22 @@ func (h *ProductHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate currency (only 3-letter codes for fiat, or "btc"/"sats" for bitcoin)
+	if input.Currency != "btc" && input.Currency != "sats" && len(input.Currency) != 3 {
+		JsonResponse(w, http.StatusBadRequest, "Currency must be a 3-letter code or 'btc'/'sats'", nil)
+		return
+	}
+
 	if input.IsRecurring && (input.BillingPeriodHours == nil || *input.BillingPeriodHours <= 0) {
 		JsonResponse(w, http.StatusBadRequest, "Billing period hours required for recurring products", nil)
 		return
+	}
+
+	// Normalize amounts for bitcoin currencies
+	amount := input.Amount
+	if input.Currency == "btc" {
+		// Convert to a more precise decimal representation for BTC
+		amount = input.Amount // Keep as is, will be interpreted as BTC
 	}
 
 	product := &Product{
@@ -249,7 +275,7 @@ func (h *ProductHandler) Update(w http.ResponseWriter, r *http.Request) {
 		Description:        input.Description,
 		Image:              input.Image,
 		IsRecurring:        input.IsRecurring,
-		Amount:             input.Amount,
+		Amount:             amount,
 		Currency:           input.Currency,
 		BillingPeriodHours: input.BillingPeriodHours,
 	}

@@ -15,7 +15,8 @@ type PaymentLink struct {
 	ID            uuid.UUID        `db:"id" json:"id"`
 	UserID        uuid.UUID        `db:"user_id" json:"user_id"`
 	AccountID     uuid.UUID        `db:"account_id" json:"account_id"`
-	Amount        int64            `db:"amount" json:"amount"`
+	Amount        float64          `db:"amount" json:"amount"`
+	Currency      string           `db:"currency" json:"currency"`
 	Metadata      *json.RawMessage `db:"metadata" json:"metadata,omitempty"`
 	Items         *json.RawMessage `db:"items" json:"items,omitempty"`
 	ExpiryMinutes int              `db:"expiry_minutes" json:"expiry_minutes"`
@@ -52,14 +53,15 @@ type PaymentLinkRepository struct{}
 func (r *PaymentLinkRepository) Create(paymentLink *PaymentLink) (*PaymentLink, error) {
 	err := db.Get(paymentLink, `
 		INSERT INTO payment_links (
-			id, user_id, account_id, amount,
+			id, user_id, account_id, amount, currency,
 			metadata, items, expiry_minutes, created_at, updated_at, deleted_at
 		) VALUES (
-			$1, $2, $3, $4, $5,
-			$6, $7, $8, $9, $10
+			$1, $2, $3, $4, $5, $6,
+			$7, $8, $9, $10, $11
 		) RETURNING *`,
-		paymentLink.ID, paymentLink.UserID, paymentLink.AccountID, paymentLink.Amount,
-		paymentLink.Metadata, paymentLink.Items, paymentLink.ExpiryMinutes, paymentLink.CreatedAt, paymentLink.UpdatedAt, paymentLink.DeletedAt)
+		paymentLink.ID, paymentLink.UserID, paymentLink.AccountID, paymentLink.Amount, paymentLink.Currency,
+		paymentLink.Metadata, paymentLink.Items, paymentLink.ExpiryMinutes,
+		paymentLink.CreatedAt, paymentLink.UpdatedAt, paymentLink.DeletedAt)
 	return paymentLink, err
 }
 
@@ -84,9 +86,10 @@ func (r *PaymentLinkRepository) GetByAccount(accountID uuid.UUID) ([]*PaymentLin
 func (r *PaymentLinkRepository) Update(paymentLink *PaymentLink) error {
 	_, err := db.Exec(`
 		UPDATE payment_links SET 
-			amount=$1, metadata=$2, items=$3, expiry_minutes=$4, updated_at=$5
-		WHERE id=$6`,
-		paymentLink.Amount, paymentLink.Metadata, paymentLink.Items,
+			amount=$1, currency=$2, metadata=$3, items=$4, 
+			expiry_minutes=$5, updated_at=$6
+		WHERE id=$7`,
+		paymentLink.Amount, paymentLink.Currency, paymentLink.Metadata, paymentLink.Items,
 		paymentLink.ExpiryMinutes, paymentLink.UpdatedAt, paymentLink.ID)
 	return err
 }
@@ -160,13 +163,37 @@ func (s *PaymentLinkService) CreateCheckoutFromLink(paymentLinkID uuid.UUID) (*C
 		return nil, err
 	}
 
+	// Get current rates at checkout creation time
+	rates := fiatRateService.GetRates()
+	ratesJSON, err := json.Marshal(rates)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert amount to int64 based on currency
+	var amountInSats int64
+	if paymentLink.Currency != "sats" && paymentLink.Currency != "btc" {
+		sats, err := fiatRateService.FiatToSatoshis(paymentLink.Amount, paymentLink.Currency)
+		if err != nil {
+			return nil, err
+		}
+		amountInSats = sats
+	} else {
+		if paymentLink.Currency == "btc" {
+			amountInSats = int64(paymentLink.Amount * 100000000)
+		} else {
+			amountInSats = int64(paymentLink.Amount)
+		}
+	}
+
 	checkout := &Checkout{
 		ID:        uuid.New(),
 		UserID:    paymentLink.UserID,
 		AccountID: paymentLink.AccountID,
-		Amount:    paymentLink.Amount,
+		Amount:    amountInSats, // Use converted amount
 		Metadata:  paymentLink.Metadata,
 		Items:     paymentLink.Items,
+		Rates:     ratesJSON,
 		ExpiresAt: time.Now().Add(time.Duration(paymentLink.ExpiryMinutes) * time.Minute),
 	}
 
@@ -184,7 +211,8 @@ var paymentLinkHandler = &PaymentLinkHandler{
 func (h *PaymentLinkHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		AccountID     uuid.UUID        `json:"account_id" validate:"required"`
-		Amount        int64            `json:"amount" validate:"required,min=1"`
+		Amount        float64          `json:"amount" validate:"required,gte=0"`
+		Currency      string           `json:"currency" validate:"required"`
 		Metadata      *json.RawMessage `json:"metadata"`
 		Items         *json.RawMessage `json:"items"`
 		ExpiryMinutes int              `json:"expiry_minutes"`
@@ -221,12 +249,13 @@ func (h *PaymentLinkHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if input.ExpiryMinutes > 0 {
 		expiryMinutes = input.ExpiryMinutes
 	}
-
+	// Create payment link without rates
 	paymentLink := &PaymentLink{
 		ID:            uuid.New(),
 		UserID:        user.ID,
 		AccountID:     input.AccountID,
 		Amount:        input.Amount,
+		Currency:      input.Currency,
 		Metadata:      input.Metadata,
 		Items:         input.Items,
 		ExpiryMinutes: expiryMinutes,
@@ -278,7 +307,8 @@ func (h *PaymentLinkHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var input struct {
-		Amount        int64            `json:"amount" validate:"required,min=1"`
+		Amount        float64          `json:"amount" validate:"required,gte=0"`
+		Currency      string           `json:"currency" validate:"required"`
 		Metadata      *json.RawMessage `json:"metadata"`
 		Items         *json.RawMessage `json:"items"`
 		ExpiryMinutes int              `json:"expiry_minutes"`
@@ -311,7 +341,9 @@ func (h *PaymentLinkHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Update the payment link fields
 	paymentLink.Amount = input.Amount
+	paymentLink.Currency = input.Currency
 	paymentLink.Metadata = input.Metadata
 	paymentLink.Items = input.Items
 	if input.ExpiryMinutes > 0 {
@@ -425,33 +457,5 @@ func (h *PaymentLinkHandler) PublicLinkHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	publicCheckout := struct {
-		ID               uuid.UUID        `json:"id"`
-		State            CheckoutState    `json:"state"`
-		Amount           int64            `json:"amount"`
-		ReceivedAmount   int64            `json:"received_amount"`
-		LightningInvoice *string          `json:"lightning_invoice,omitempty"`
-		BitcoinAddress   *string          `json:"bitcoin_address,omitempty"`
-		Metadata         *json.RawMessage `json:"metadata,omitempty"`
-		Items            *json.RawMessage `json:"items,omitempty"`
-		ExpiresAt        time.Time        `json:"expires_at"`
-		CreatedAt        time.Time        `json:"created_at"`
-	}{
-		ID:               checkout.ID,
-		State:            checkout.State,
-		Amount:           checkout.Amount,
-		ReceivedAmount:   checkout.ReceivedAmount,
-		LightningInvoice: checkout.LightningInvoice,
-		BitcoinAddress:   checkout.BitcoinAddress,
-		Metadata:         checkout.Metadata,
-		Items:            checkout.Items,
-		ExpiresAt:        checkout.ExpiresAt,
-		CreatedAt:        checkout.CreatedAt,
-	}
-
-	JsonResponse(w, http.StatusOK, "Checkout created from payment link", publicCheckout)
-}
-
-func init() {
-	paymentLinkService = NewPaymentLinkService()
+	JsonResponse(w, http.StatusOK, "Checkout created from payment link", checkout)
 }

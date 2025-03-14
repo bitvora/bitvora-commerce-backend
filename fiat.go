@@ -52,7 +52,7 @@ func NewFiatRateService() *FiatRateService {
 
 // startRateUpdater runs a ticker to update the exchange rates periodically
 func (s *FiatRateService) startRateUpdater() {
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 
 	for {
