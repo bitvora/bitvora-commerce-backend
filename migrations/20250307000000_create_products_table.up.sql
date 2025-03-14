@@ -8,8 +8,8 @@ CREATE TABLE products (
     description TEXT,
     image VARCHAR(255),
     is_recurring BOOLEAN NOT NULL DEFAULT FALSE,
-    amount DECIMAL(10, 2) NOT NULL,
-    currency VARCHAR(3) NOT NULL,
+    amount DECIMAL(10, 2) NOT NULL, -- Price amount
+    currency VARCHAR(10) NOT NULL,  -- Currency code (fiat or crypto)
     billing_period_hours INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

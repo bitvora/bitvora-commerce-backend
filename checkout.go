@@ -213,7 +213,6 @@ func (s *CheckoutService) Create(checkout *Checkout) (*Checkout, error) {
 	if checkout.Type == "" {
 		checkout.Type = CheckoutTypeSingle
 	}
-
 	// For single checkouts, automatically create a lightning invoice and bitcoin address
 	if checkout.Type == CheckoutTypeSingle {
 		if wallet, err := walletService.GetActiveWalletByAccount(checkout.AccountID); err == nil {
@@ -336,14 +335,15 @@ var checkoutHandler = &CheckoutHandler{
 }
 
 func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
+	// amount and currency are optional if product_id is provided
 	var input struct {
 		AccountID      uuid.UUID        `json:"account_id" validate:"required"`
 		CustomerID     *uuid.UUID       `json:"customer_id"`
 		SubscriptionID *uuid.UUID       `json:"subscription_id"`
 		ProductID      *uuid.UUID       `json:"product_id"`
 		Type           CheckoutType     `json:"type"`
-		Amount         float64          `json:"amount" validate:"required,gte=0"`
-		Currency       string           `json:"currency" validate:"required"`
+		Amount         float64          `json:"amount" validate:"required_without=ProductID,gte=0"`
+		Currency       string           `json:"currency" validate:"required_without=ProductID"`
 		Metadata       *json.RawMessage `json:"metadata"`
 		Items          *json.RawMessage `json:"items"`
 		ExpiryMinutes  int              `json:"expiry_minutes"`
@@ -377,6 +377,15 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
 		return
+	}
+
+	// If there's a product ID associated, use its price and currency
+	if input.ProductID != nil {
+		product, err := productService.Get(*input.ProductID)
+		if err == nil {
+			input.Amount = product.Amount
+			input.Currency = product.Currency
+		}
 	}
 
 	var satsAmount int64
