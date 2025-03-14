@@ -13,6 +13,7 @@ CREATE TABLE checkouts (
     bitcoin_address TEXT,
     metadata JSONB,
     items JSONB,
+    rates JSONB,
     expires_at TIMESTAMP NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
