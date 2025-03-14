@@ -2,11 +2,15 @@ package main
 
 import (
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 
 	"github.com/joho/godotenv"
 )
+
+// Declare a global logger variable
+var logger *slog.Logger
 
 func main() {
 	err := godotenv.Load()
@@ -14,9 +18,13 @@ func main() {
 		log.Fatalf("Error loading .env file")
 	}
 
+	// Initialize the global logger with JSON handler
+	logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
 	notificationService = NewNotificationService()
 	webhookService = NewWebhookService()
 	checkoutService = NewCheckoutService()
+	walletService = &WalletService{}
 
 	InitDB()
 	r := InitRoutes()
@@ -27,9 +35,10 @@ func main() {
 		port = "2121"
 	}
 
-	log.Printf("Starting server on port %s", port)
+	logger.Info("Starting server on port", slog.String("port", port)) // Use the global logger
 	err = http.ListenAndServe(":"+port, r)
 	if err != nil {
+		logger.Error("Server failed", err.Error()) // Use the global logger
 		log.Fatal(err)
 	}
 }

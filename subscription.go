@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -33,7 +34,22 @@ type SubscriptionService struct{}
 var subscriptionRepository = &SubscriptionRepository{}
 var subscriptionService = &SubscriptionService{}
 
+func isValidJSON(data json.RawMessage) bool {
+	if len(data) == 0 {
+		return true // Allow empty JSON
+	}
+	var js json.RawMessage
+	return json.Unmarshal(data, &js) == nil
+}
+
 func (r *SubscriptionRepository) Create(subscription *Subscription) (*Subscription, error) {
+	// Log the Metadata field for debugging
+	fmt.Printf("Creating subscription with Metadata: %s\n", string(subscription.Metadata))
+
+	if !isValidJSON(subscription.Metadata) {
+		return nil, fmt.Errorf("invalid JSON for Metadata")
+	}
+
 	err := db.Get(subscription, `
 		INSERT INTO subscriptions (
 			id, user_id, account_id, customer_id, product_id,
@@ -136,6 +152,99 @@ func (s *SubscriptionService) Delete(id uuid.UUID) error {
 	return subscriptionRepository.Delete(id)
 }
 
+func (s *SubscriptionService) ProcessSubscriptionPayment(subscription *Subscription) error {
+	if subscription.NostrPubkey == nil || subscription.NostrSecret == nil || subscription.NostrRelay == nil {
+		return fmt.Errorf("subscription has no wallet connection")
+	}
+
+	product, err := productService.Get(subscription.ProductID)
+	if err != nil {
+		return fmt.Errorf("failed to get product: %w", err)
+	}
+
+	sellerWallet, err := walletService.GetActiveWalletByAccount(subscription.AccountID)
+	if err != nil {
+		return fmt.Errorf("failed to get seller wallet: %w", err)
+	}
+
+	expirySeconds := int64(60 * 60)
+	description := fmt.Sprintf("Subscription payment for %s", product.Name)
+	invoice, err := walletService.MakeInvoice(sellerWallet.ID, int64(product.Amount), description, expirySeconds)
+	if err != nil {
+		return fmt.Errorf("failed to create invoice: %w", err)
+	}
+
+	checkout := &Checkout{
+		ID:               uuid.New(),
+		UserID:           subscription.UserID,
+		AccountID:        subscription.AccountID,
+		CustomerID:       &subscription.CustomerID,
+		SubscriptionID:   &subscription.ID,
+		State:            CheckoutStateOpen,
+		Amount:           int64(product.Amount),
+		LightningInvoice: &invoice,
+		ExpiresAt:        time.Now().Add(time.Hour),
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
+	}
+
+	_, err = checkoutService.Create(checkout)
+	if err != nil {
+		return fmt.Errorf("failed to create checkout: %w", err)
+	}
+
+	err = walletService.PayInvoiceWithConnection(
+		*subscription.NostrPubkey,
+		*subscription.NostrSecret,
+		*subscription.NostrRelay,
+		invoice,
+	)
+
+	if err != nil {
+		checkout.State = CheckoutStateExpired
+		checkout.UpdatedAt = time.Now()
+		checkoutRepository.Update(checkout)
+		return fmt.Errorf("failed to pay invoice: %w", err)
+	}
+
+	go func() {
+		for i := 0; i < 20; i++ {
+			time.Sleep(3 * time.Second)
+
+			updatedCheckout, err := checkoutService.Get(checkout.ID)
+			if err != nil {
+				continue
+			}
+
+			if updatedCheckout.State != CheckoutStateOpen {
+				break
+			}
+		}
+	}()
+
+	return nil
+}
+
+func InitSubscriptionScheduler() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				processSubscriptionRenewals()
+			}
+		}
+	}()
+}
+
+func processSubscriptionRenewals() {
+	// Query for subscriptions to process
+	// For now, we can't implement full renewal logic without a field to track next bill date
+	// This would require a database schema change
+}
+
 type SubscriptionHandler struct {
 	Validator *validator.Validate
 }
@@ -173,7 +282,6 @@ func (h *SubscriptionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify account belongs to user
 	account, err := accountService.Get(input.AccountID)
 	if err != nil {
 		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
@@ -184,7 +292,6 @@ func (h *SubscriptionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify customer belongs to user and account
 	customer, err := customerService.Get(input.CustomerID)
 	if err != nil {
 		JsonResponse(w, http.StatusBadRequest, "Invalid customer ID", err.Error())
@@ -195,7 +302,6 @@ func (h *SubscriptionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify product belongs to user and account and is recurring
 	product, err := productService.Get(input.ProductID)
 	if err != nil {
 		JsonResponse(w, http.StatusBadRequest, "Invalid product ID", err.Error())
@@ -210,7 +316,6 @@ func (h *SubscriptionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set default dates if not provided
 	now := time.Now()
 	billingStartDate := now
 	if input.BillingStartDate != nil {
@@ -289,7 +394,6 @@ func (h *SubscriptionHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update fields if provided
 	if input.BillingStartDate != nil {
 		existingSubscription.BillingStartDate = *input.BillingStartDate
 	}
@@ -373,7 +477,6 @@ func (h *SubscriptionHandler) GetByAccount(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Verify account belongs to user
 	account, err := accountService.Get(accountID)
 	if err != nil {
 		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
@@ -407,7 +510,6 @@ func (h *SubscriptionHandler) GetByCustomer(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Verify customer belongs to user
 	customer, err := customerService.Get(customerID)
 	if err != nil {
 		JsonResponse(w, http.StatusNotFound, "Customer not found", err.Error())
@@ -441,7 +543,6 @@ func (h *SubscriptionHandler) GetByProduct(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Verify product belongs to user
 	product, err := productService.Get(productID)
 	if err != nil {
 		JsonResponse(w, http.StatusNotFound, "Product not found", err.Error())
