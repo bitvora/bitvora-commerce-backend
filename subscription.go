@@ -255,7 +255,7 @@ var subscriptionHandler = &SubscriptionHandler{
 
 func (h *SubscriptionHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		AccountID        uuid.UUID       `json:"account_id" validate:"required"`
+		AccountID        uuid.UUID       `json:"account_id"`
 		CustomerID       uuid.UUID       `json:"customer_id" validate:"required"`
 		ProductID        uuid.UUID       `json:"product_id" validate:"required"`
 		BillingStartDate *time.Time      `json:"billing_start_date"`
@@ -282,49 +282,80 @@ func (h *SubscriptionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, err := accountService.Get(input.AccountID)
-	if err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
-		return
-	}
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to create subscriptions for this account", nil)
-		return
+	var account *Account
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "subscriptions", "create") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to create subscriptions", nil)
+			return
+		}
+
+		account, err = GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		input.AccountID = account.ID
+	} else {
+		if input.AccountID == uuid.Nil {
+			JsonResponse(w, http.StatusBadRequest, "Account ID is required", nil)
+			return
+		}
+
+		account, err = accountService.Get(input.AccountID)
+		if err != nil {
+			JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to create subscriptions for this account", nil)
+			return
+		}
 	}
 
 	customer, err := customerService.Get(input.CustomerID)
 	if err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid customer ID", err.Error())
+		JsonResponse(w, http.StatusNotFound, "Customer not found", err.Error())
 		return
 	}
-	if customer.UserID != user.ID || customer.AccountID != input.AccountID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to use this customer", nil)
+
+	if customer.AccountID != input.AccountID {
+		JsonResponse(w, http.StatusBadRequest, "Customer does not belong to this account", nil)
 		return
 	}
 
 	product, err := productService.Get(input.ProductID)
 	if err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid product ID", err.Error())
-		return
-	}
-	if product.UserID != user.ID || product.AccountID != input.AccountID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to use this product", nil)
-		return
-	}
-	if !product.IsRecurring {
-		JsonResponse(w, http.StatusBadRequest, "Subscriptions can only be created for recurring products", nil)
+		JsonResponse(w, http.StatusNotFound, "Product not found", err.Error())
 		return
 	}
 
-	now := time.Now()
-	billingStartDate := now
+	if product.AccountID != input.AccountID {
+		JsonResponse(w, http.StatusBadRequest, "Product does not belong to this account", nil)
+		return
+	}
+
+	if !product.IsRecurring {
+		JsonResponse(w, http.StatusBadRequest, "Cannot create subscription for non-recurring product", nil)
+		return
+	}
+
+	billingStartDate := time.Now()
 	if input.BillingStartDate != nil {
 		billingStartDate = *input.BillingStartDate
 	}
 
-	activeOnDate := now
+	activeOnDate := time.Now()
 	if input.ActiveOnDate != nil {
 		activeOnDate = *input.ActiveOnDate
+	}
+
+	metadata := input.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage(`{}`)
 	}
 
 	subscription := &Subscription{
@@ -335,7 +366,7 @@ func (h *SubscriptionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		ProductID:        input.ProductID,
 		BillingStartDate: billingStartDate,
 		ActiveOnDate:     activeOnDate,
-		Metadata:         input.Metadata,
+		Metadata:         metadata,
 		NostrRelay:       input.NostrRelay,
 		NostrPubkey:      input.NostrPubkey,
 		NostrSecret:      input.NostrSecret,
@@ -351,15 +382,16 @@ func (h *SubscriptionHandler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *SubscriptionHandler) Update(w http.ResponseWriter, r *http.Request) {
-	subscriptionIDStr := chi.URLParam(r, "id")
-	if subscriptionIDStr == "" {
-		JsonResponse(w, http.StatusBadRequest, "Subscription ID is required", nil)
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid subscription ID", nil)
 		return
 	}
 
-	subscriptionID, err := uuid.Parse(subscriptionIDStr)
+	existingSubscription, err := subscriptionService.Get(id)
 	if err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid subscription ID", err.Error())
+		JsonResponse(w, http.StatusNotFound, "Subscription not found", err.Error())
 		return
 	}
 
@@ -369,15 +401,28 @@ func (h *SubscriptionHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existingSubscription, err := subscriptionService.Get(subscriptionID)
-	if err != nil {
-		JsonResponse(w, http.StatusNotFound, "Subscription not found", err.Error())
-		return
-	}
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "subscriptions", "update") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to update subscriptions", nil)
+			return
+		}
 
-	if existingSubscription.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to update this subscription", nil)
-		return
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if existingSubscription.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This subscription belongs to a different account", nil)
+			return
+		}
+	} else {
+		if existingSubscription.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to update this subscription", nil)
+			return
+		}
 	}
 
 	var input struct {
@@ -402,13 +447,21 @@ func (h *SubscriptionHandler) Update(w http.ResponseWriter, r *http.Request) {
 		existingSubscription.ActiveOnDate = *input.ActiveOnDate
 	}
 
-	if input.Metadata != nil {
+	if len(input.Metadata) > 0 {
 		existingSubscription.Metadata = input.Metadata
 	}
 
-	existingSubscription.NostrRelay = input.NostrRelay
-	existingSubscription.NostrPubkey = input.NostrPubkey
-	existingSubscription.NostrSecret = input.NostrSecret
+	if input.NostrRelay != nil {
+		existingSubscription.NostrRelay = input.NostrRelay
+	}
+
+	if input.NostrPubkey != nil {
+		existingSubscription.NostrPubkey = input.NostrPubkey
+	}
+
+	if input.NostrSecret != nil {
+		existingSubscription.NostrSecret = input.NostrSecret
+	}
 
 	err = subscriptionService.Update(existingSubscription)
 	if err != nil {
@@ -439,9 +492,28 @@ func (h *SubscriptionHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if subscription.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view this subscription", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "subscriptions", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read subscriptions", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if subscription.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This subscription belongs to a different account", nil)
+			return
+		}
+	} else {
+		if subscription.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view this subscription", nil)
+			return
+		}
 	}
 
 	JsonResponse(w, http.StatusOK, "Subscription retrieved successfully", subscription)
@@ -451,6 +523,29 @@ func (h *SubscriptionHandler) GetAll(w http.ResponseWriter, r *http.Request) {
 	user, err := GetUserFromContext(r.Context())
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "subscriptions", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read subscriptions", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		subscriptions, err := subscriptionService.GetByAccount(account.ID)
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving subscriptions", err.Error())
+			return
+		}
+
+		JsonResponse(w, http.StatusOK, "Subscriptions retrieved successfully", subscriptions)
 		return
 	}
 
@@ -477,14 +572,34 @@ func (h *SubscriptionHandler) GetByAccount(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	account, err := accountService.Get(accountID)
-	if err != nil {
-		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
-		return
-	}
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view subscriptions for this account", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "subscriptions", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read subscriptions", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if accountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This account ID doesn't match the API key's account", nil)
+			return
+		}
+	} else {
+		account, err := accountService.Get(accountID)
+		if err != nil {
+			JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view subscriptions for this account", nil)
+			return
+		}
 	}
 
 	subscriptions, err := subscriptionService.GetByAccount(accountID)
@@ -515,9 +630,29 @@ func (h *SubscriptionHandler) GetByCustomer(w http.ResponseWriter, r *http.Reque
 		JsonResponse(w, http.StatusNotFound, "Customer not found", err.Error())
 		return
 	}
-	if customer.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view subscriptions for this customer", nil)
-		return
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "subscriptions", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read subscriptions", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if customer.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This customer belongs to a different account", nil)
+			return
+		}
+	} else {
+		if customer.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view subscriptions for this customer", nil)
+			return
+		}
 	}
 
 	subscriptions, err := subscriptionService.GetByCustomer(customerID)
@@ -548,9 +683,29 @@ func (h *SubscriptionHandler) GetByProduct(w http.ResponseWriter, r *http.Reques
 		JsonResponse(w, http.StatusNotFound, "Product not found", err.Error())
 		return
 	}
-	if product.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view subscriptions for this product", nil)
-		return
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "subscriptions", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read subscriptions", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if product.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This product belongs to a different account", nil)
+			return
+		}
+	} else {
+		if product.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view subscriptions for this product", nil)
+			return
+		}
 	}
 
 	subscriptions, err := subscriptionService.GetByProduct(productID)
@@ -582,9 +737,28 @@ func (h *SubscriptionHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if subscription.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to delete this subscription", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "subscriptions", "delete") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to delete subscriptions", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if subscription.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This subscription belongs to a different account", nil)
+			return
+		}
+	} else {
+		if subscription.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to delete this subscription", nil)
+			return
+		}
 	}
 
 	err = subscriptionService.Delete(id)
