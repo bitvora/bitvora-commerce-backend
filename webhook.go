@@ -612,32 +612,21 @@ var webhookHandler = &WebhookHandler{
 
 func (h *WebhookHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		AccountID   uuid.UUID      `json:"account_id" validate:"required"`
-		URL         string         `json:"url" validate:"required,url"`
-		Description string         `json:"description"`
-		Events      []WebhookEvent `json:"events" validate:"required"`
+		AccountID   uuid.UUID        `json:"account_id"`
+		URL         string           `json:"url" validate:"required,url"`
+		Description string           `json:"description"`
+		Events      WebhookEventList `json:"events" validate:"required"`
+		Enabled     bool             `json:"enabled"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid request format", err.Error())
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
 		return
 	}
 
 	if err := h.Validator.Struct(input); err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid request data", err.Error())
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
 		return
-	}
-
-	validEvents := make(map[string]bool)
-	for _, event := range AllWebhookEvents {
-		validEvents[string(event)] = true
-	}
-
-	for _, event := range input.Events {
-		if !validEvents[string(event)] {
-			JsonResponse(w, http.StatusBadRequest, "Invalid event type", fmt.Sprintf("Event '%s' is not a valid event type", event))
-			return
-		}
 	}
 
 	user, err := GetUserFromContext(r.Context())
@@ -646,24 +635,59 @@ func (h *WebhookHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, err := accountService.Get(input.AccountID)
-	if err != nil {
-		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
-		return
+	var account *Account
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "webhooks", "create") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to create webhooks", nil)
+			return
+		}
+
+		account, err = GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		input.AccountID = account.ID
+	} else {
+		if input.AccountID == uuid.Nil {
+			JsonResponse(w, http.StatusBadRequest, "Account ID is required", nil)
+			return
+		}
+
+		account, err = accountService.Get(input.AccountID)
+		if err != nil {
+			JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to create webhooks for this account", nil)
+			return
+		}
 	}
 
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to create webhooks for this account", nil)
+	// Generate a webhook secret
+	secret := make([]byte, 32)
+	_, err = rand.Read(secret)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error generating webhook secret", err.Error())
 		return
 	}
+	secretHex := hex.EncodeToString(secret)
 
 	webhook := &Webhook{
 		UserID:      user.ID,
 		AccountID:   input.AccountID,
 		URL:         input.URL,
 		Description: input.Description,
-		Enabled:     true,
+		Secret:      secretHex,
+		Enabled:     input.Enabled,
 		Events:      input.Events,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
 	}
 
 	createdWebhook, err := webhookService.Create(webhook)
@@ -672,7 +696,12 @@ func (h *WebhookHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	JsonResponse(w, http.StatusCreated, "Webhook created successfully", createdWebhook)
+	response := map[string]interface{}{
+		"webhook": createdWebhook,
+		"secret":  secretHex,
+	}
+
+	JsonResponse(w, http.StatusCreated, "Webhook created successfully", response)
 }
 
 func (h *WebhookHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -700,12 +729,32 @@ func (h *WebhookHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if webhook.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view this webhook", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "webhooks", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read webhooks", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if webhook.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This webhook belongs to a different account", nil)
+			return
+		}
+	} else {
+		if webhook.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view this webhook", nil)
+			return
+		}
 	}
 
-	webhookResponse := WebhookWithoutSecret{
+	// Return without the secret
+	webhookWithoutSecret := &WebhookWithoutSecret{
 		ID:          webhook.ID,
 		UserID:      webhook.UserID,
 		AccountID:   webhook.AccountID,
@@ -717,7 +766,7 @@ func (h *WebhookHandler) Get(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:   webhook.UpdatedAt,
 	}
 
-	JsonResponse(w, http.StatusOK, "Webhook retrieved successfully", webhookResponse)
+	JsonResponse(w, http.StatusOK, "Webhook retrieved successfully", webhookWithoutSecret)
 }
 
 func (h *WebhookHandler) GetByAccount(w http.ResponseWriter, r *http.Request) {
@@ -739,15 +788,34 @@ func (h *WebhookHandler) GetByAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, err := accountService.Get(accountID)
-	if err != nil {
-		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
-		return
-	}
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "webhooks", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read webhooks", nil)
+			return
+		}
 
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view webhooks for this account", nil)
-		return
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if accountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This account ID doesn't match the API key's account", nil)
+			return
+		}
+	} else {
+		account, err := accountService.Get(accountID)
+		if err != nil {
+			JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view webhooks for this account", nil)
+			return
+		}
 	}
 
 	webhooks, err := webhookService.GetByAccount(accountID)
@@ -756,7 +824,23 @@ func (h *WebhookHandler) GetByAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	JsonResponse(w, http.StatusOK, "Webhooks retrieved successfully", webhooks)
+	// Return list without secrets
+	webhooksWithoutSecrets := make([]*WebhookWithoutSecret, len(webhooks))
+	for i, webhook := range webhooks {
+		webhooksWithoutSecrets[i] = &WebhookWithoutSecret{
+			ID:          webhook.ID,
+			UserID:      webhook.UserID,
+			AccountID:   webhook.AccountID,
+			URL:         webhook.URL,
+			Description: webhook.Description,
+			Enabled:     webhook.Enabled,
+			Events:      webhook.Events,
+			CreatedAt:   webhook.CreatedAt,
+			UpdatedAt:   webhook.UpdatedAt,
+		}
+	}
+
+	JsonResponse(w, http.StatusOK, "Webhooks retrieved successfully", webhooksWithoutSecrets)
 }
 
 func (h *WebhookHandler) Update(w http.ResponseWriter, r *http.Request) {
@@ -772,7 +856,7 @@ func (h *WebhookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	webhook, err := webhookService.Get(id)
+	existingWebhook, err := webhookService.Get(id)
 	if err != nil {
 		JsonResponse(w, http.StatusNotFound, "Webhook not found", err.Error())
 		return
@@ -784,64 +868,79 @@ func (h *WebhookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if webhook.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to update this webhook", nil)
-		return
-	}
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "webhooks", "update") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to update webhooks", nil)
+			return
+		}
 
-	var input struct {
-		URL         string         `json:"url" validate:"required,url"`
-		Description string         `json:"description"`
-		Enabled     bool           `json:"enabled"`
-		Events      []WebhookEvent `json:"events" validate:"required"`
-	}
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
 
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid request format", err.Error())
-		return
-	}
-
-	if err := h.Validator.Struct(input); err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid request data", err.Error())
-		return
-	}
-
-	validEvents := make(map[string]bool)
-	for _, event := range AllWebhookEvents {
-		validEvents[string(event)] = true
-	}
-
-	for _, event := range input.Events {
-		if !validEvents[string(event)] {
-			JsonResponse(w, http.StatusBadRequest, "Invalid event type", fmt.Sprintf("Event '%s' is not a valid event type", event))
+		if existingWebhook.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This webhook belongs to a different account", nil)
+			return
+		}
+	} else {
+		if existingWebhook.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to update this webhook", nil)
 			return
 		}
 	}
 
-	webhook.URL = input.URL
-	webhook.Description = input.Description
-	webhook.Enabled = input.Enabled
-	webhook.Events = input.Events
+	var input struct {
+		URL         string           `json:"url" validate:"omitempty,url"`
+		Description string           `json:"description"`
+		Events      WebhookEventList `json:"events"`
+		Enabled     *bool            `json:"enabled"`
+	}
 
-	err = webhookService.Update(webhook)
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	if err := h.Validator.Struct(input); err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	if input.URL != "" {
+		existingWebhook.URL = input.URL
+	}
+	existingWebhook.Description = input.Description
+	if input.Events != nil {
+		existingWebhook.Events = input.Events
+	}
+	if input.Enabled != nil {
+		existingWebhook.Enabled = *input.Enabled
+	}
+	existingWebhook.UpdatedAt = time.Now()
+
+	err = webhookService.Update(existingWebhook)
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Error updating webhook", err.Error())
 		return
 	}
 
-	webhookResponse := WebhookWithoutSecret{
-		ID:          webhook.ID,
-		UserID:      webhook.UserID,
-		AccountID:   webhook.AccountID,
-		URL:         webhook.URL,
-		Description: webhook.Description,
-		Enabled:     webhook.Enabled,
-		Events:      webhook.Events,
-		CreatedAt:   webhook.CreatedAt,
-		UpdatedAt:   webhook.UpdatedAt,
+	// Return without the secret
+	webhookWithoutSecret := &WebhookWithoutSecret{
+		ID:          existingWebhook.ID,
+		UserID:      existingWebhook.UserID,
+		AccountID:   existingWebhook.AccountID,
+		URL:         existingWebhook.URL,
+		Description: existingWebhook.Description,
+		Enabled:     existingWebhook.Enabled,
+		Events:      existingWebhook.Events,
+		CreatedAt:   existingWebhook.CreatedAt,
+		UpdatedAt:   existingWebhook.UpdatedAt,
 	}
 
-	JsonResponse(w, http.StatusOK, "Webhook updated successfully", webhookResponse)
+	JsonResponse(w, http.StatusOK, "Webhook updated successfully", webhookWithoutSecret)
 }
 
 func (h *WebhookHandler) RegenerateSecret(w http.ResponseWriter, r *http.Request) {
@@ -869,9 +968,28 @@ func (h *WebhookHandler) RegenerateSecret(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if webhook.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to regenerate the secret for this webhook", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "webhooks", "update") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to update webhooks", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if webhook.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This webhook belongs to a different account", nil)
+			return
+		}
+	} else {
+		if webhook.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to regenerate the secret for this webhook", nil)
+			return
+		}
 	}
 
 	newSecret, err := webhookService.RegenerateSecret(id)
@@ -908,9 +1026,28 @@ func (h *WebhookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if webhook.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to delete this webhook", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "webhooks", "delete") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to delete webhooks", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if webhook.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This webhook belongs to a different account", nil)
+			return
+		}
+	} else {
+		if webhook.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to delete this webhook", nil)
+			return
+		}
 	}
 
 	err = webhookService.Delete(id)
@@ -947,9 +1084,28 @@ func (h *WebhookHandler) GetDeliveries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if webhook.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view deliveries for this webhook", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "webhooks", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read webhook deliveries", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if webhook.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This webhook belongs to a different account", nil)
+			return
+		}
+	} else {
+		if webhook.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view deliveries for this webhook", nil)
+			return
+		}
 	}
 
 	limitStr := r.URL.Query().Get("limit")
@@ -1014,9 +1170,28 @@ func (h *WebhookHandler) RetryDelivery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if webhook.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to retry this webhook delivery", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "webhooks", "update") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to retry webhook deliveries", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if webhook.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This webhook belongs to a different account", nil)
+			return
+		}
+	} else {
+		if webhook.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to retry this webhook delivery", nil)
+			return
+		}
 	}
 
 	newDelivery, err := webhookService.RetryDelivery(deliveryID)

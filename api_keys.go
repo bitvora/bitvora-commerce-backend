@@ -31,6 +31,7 @@ type APIKeyPermissions struct {
 	Checkouts     ResourcePermission `json:"checkouts" validate:"required"`
 	Wallets       ResourcePermission `json:"wallets" validate:"required"`
 	Invoices      ResourcePermission `json:"invoices" validate:"required"`
+	Webhooks      ResourcePermission `json:"webhooks" validate:"required"`
 }
 
 type APIKey struct {
@@ -766,4 +767,57 @@ func APIKeyMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func DefaultPermissions() APIKeyPermissions {
+	return APIKeyPermissions{
+		Customers: ResourcePermission{
+			Read:   true,
+			Create: true,
+			Update: true,
+			Delete: true,
+		},
+		Products: ResourcePermission{
+			Read:   true,
+			Create: true,
+			Update: true,
+			Delete: true,
+		},
+		Subscriptions: ResourcePermission{
+			Read:   true,
+			Create: true,
+			Update: true,
+			Delete: true,
+		},
+		PaymentLinks: ResourcePermission{
+			Read:   true,
+			Create: true,
+			Update: true,
+			Delete: true,
+		},
+		Checkouts: ResourcePermission{
+			Read:   true,
+			Create: true,
+			Update: true,
+			Delete: true,
+		},
+		Wallets: ResourcePermission{
+			Read:   true,
+			Create: true,
+			Update: true,
+			Delete: true,
+		},
+		Invoices: ResourcePermission{
+			Read:   true,
+			Create: true,
+			Update: true,
+			Delete: true,
+		},
+		Webhooks: ResourcePermission{
+			Read:   true,
+			Create: true,
+			Update: true,
+			Delete: true,
+		},
+	}
 }

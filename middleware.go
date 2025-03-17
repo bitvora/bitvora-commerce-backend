@@ -137,6 +137,8 @@ func CheckAPIPermission(ctx context.Context, resource string, action string) boo
 		permission = apiKey.Permissions.Wallets
 	case "invoices":
 		permission = apiKey.Permissions.Invoices
+	case "webhooks":
+		permission = apiKey.Permissions.Webhooks
 	default:
 		return false
 	}
