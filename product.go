@@ -122,7 +122,7 @@ var productHandler = &ProductHandler{
 
 func (h *ProductHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		AccountID          uuid.UUID `json:"account_id" validate:"required"`
+		AccountID          uuid.UUID `json:"account_id"`
 		Name               string    `json:"name" validate:"required"`
 		Description        *string   `json:"description,omitempty"`
 		Image              *string   `json:"image,omitempty"`
@@ -159,15 +159,38 @@ func (h *ProductHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, err := accountService.Get(input.AccountID)
-	if err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
-		return
-	}
+	var account *Account
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
 
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to create products for this account", nil)
-		return
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "products", "create") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to create products", nil)
+			return
+		}
+
+		account, err = GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		input.AccountID = account.ID
+	} else {
+		if input.AccountID == uuid.Nil {
+			JsonResponse(w, http.StatusBadRequest, "Account ID is required", nil)
+			return
+		}
+
+		account, err = accountService.Get(input.AccountID)
+		if err != nil {
+			JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to create products for this account", nil)
+			return
+		}
 	}
 
 	// Normalize amounts for bitcoin currencies
@@ -224,9 +247,28 @@ func (h *ProductHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if existingProduct.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to update this product", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "products", "update") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to update products", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if existingProduct.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This product belongs to a different account", nil)
+			return
+		}
+	} else {
+		if existingProduct.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to update this product", nil)
+			return
+		}
 	}
 
 	var input struct {
@@ -309,9 +351,28 @@ func (h *ProductHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if product.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view this product", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "products", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read products", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if product.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This product belongs to a different account", nil)
+			return
+		}
+	} else {
+		if product.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view this product", nil)
+			return
+		}
 	}
 
 	JsonResponse(w, http.StatusOK, "Product retrieved successfully", product)
@@ -321,6 +382,29 @@ func (h *ProductHandler) GetAll(w http.ResponseWriter, r *http.Request) {
 	user, err := GetUserFromContext(r.Context())
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "products", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read products", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		products, err := productService.GetByAccount(account.ID)
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving products", err.Error())
+			return
+		}
+
+		JsonResponse(w, http.StatusOK, "Products retrieved successfully", products)
 		return
 	}
 
@@ -347,15 +431,34 @@ func (h *ProductHandler) GetByAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, err := accountService.Get(accountID)
-	if err != nil {
-		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
-		return
-	}
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "products", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read products", nil)
+			return
+		}
 
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view products for this account", nil)
-		return
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if accountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This account ID doesn't match the API key's account", nil)
+			return
+		}
+	} else {
+		account, err := accountService.Get(accountID)
+		if err != nil {
+			JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view products for this account", nil)
+			return
+		}
 	}
 
 	products, err := productService.GetByAccount(accountID)
@@ -387,9 +490,28 @@ func (h *ProductHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if product.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to delete this product", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "products", "delete") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to delete products", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if product.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This product belongs to a different account", nil)
+			return
+		}
+	} else {
+		if product.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to delete this product", nil)
+			return
+		}
 	}
 
 	err = productService.Delete(id)
