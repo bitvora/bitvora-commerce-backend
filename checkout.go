@@ -335,9 +335,8 @@ var checkoutHandler = &CheckoutHandler{
 }
 
 func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
-	// amount and currency are optional if product_id is provided
 	var input struct {
-		AccountID      uuid.UUID        `json:"account_id" validate:"required"`
+		AccountID      uuid.UUID        `json:"account_id"`
 		CustomerID     *uuid.UUID       `json:"customer_id"`
 		SubscriptionID *uuid.UUID       `json:"subscription_id"`
 		ProductID      *uuid.UUID       `json:"product_id"`
@@ -365,7 +364,7 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
 		return
 	}
-	// Validate checkout type
+
 	if input.Type != "" &&
 		input.Type != CheckoutTypeSingle &&
 		input.Type != CheckoutTypeSubscription {
@@ -379,7 +378,40 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If there's a product ID associated, use its price and currency
+	var account *Account
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "checkouts", "create") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to create checkouts", nil)
+			return
+		}
+
+		account, err = GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		input.AccountID = account.ID
+	} else {
+		if input.AccountID == uuid.Nil {
+			JsonResponse(w, http.StatusBadRequest, "Account ID is required", nil)
+			return
+		}
+
+		account, err = accountService.Get(input.AccountID)
+		if err != nil {
+			JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to create checkouts for this account", nil)
+			return
+		}
+	}
+
 	if input.ProductID != nil {
 		product, err := productService.Get(*input.ProductID)
 		if err == nil {
@@ -403,17 +435,6 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		} else {
 			satsAmount = int64(input.Amount)
 		}
-	}
-
-	account, err := accountService.Get(input.AccountID)
-	if err != nil {
-		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
-		return
-	}
-
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to create checkouts for this account", nil)
-		return
 	}
 
 	if input.CustomerID != nil {
@@ -447,7 +468,7 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	expiryMinutes := 1440 // 24 hours
+	expiryMinutes := 1440
 	if input.ExpiryMinutes > 0 {
 		expiryMinutes = input.ExpiryMinutes
 	}
