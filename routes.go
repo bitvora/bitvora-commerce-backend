@@ -35,7 +35,7 @@ func InitRoutes() http.Handler {
 	r.Get("/c/{id}/poll", checkoutHandler.PollInvoice)
 
 	r.Group(func(r chi.Router) {
-		r.Use(AuthMiddleware)
+		r.Use(CombinedAuthMiddleware)
 
 		r.Get("/dashboard", userHandler.Dashboard)
 		r.Post("/account", accountHandler.Create)
