@@ -44,6 +44,7 @@ type Checkout struct {
 	ReceivedAmount   int64            `db:"received_amount" json:"received_amount"`
 	LightningInvoice *string          `db:"lightning_invoice" json:"lightning_invoice,omitempty"`
 	BitcoinAddress   *string          `db:"bitcoin_address" json:"bitcoin_address,omitempty"`
+	RedirectURL      *string          `db:"redirect_url" json:"redirect_url,omitempty"`
 	Metadata         *json.RawMessage `db:"metadata" json:"metadata,omitempty"`
 	Items            *json.RawMessage `db:"items" json:"items,omitempty"`
 	Rates            json.RawMessage  `db:"rates" json:"rates,omitempty"`
@@ -83,15 +84,15 @@ func (r *CheckoutRepository) Create(checkout *Checkout) (*Checkout, error) {
 		INSERT INTO checkouts (
 			id, user_id, account_id, customer_id, subscription_id,
 			product_id, type, state, amount, received_amount, lightning_invoice, bitcoin_address,
-			metadata, items, rates, expires_at, created_at, updated_at, deleted_at
+			redirect_url, metadata, items, rates, expires_at, created_at, updated_at, deleted_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
-			$6, $7, $8, $9, $10, $11,
-			$12, $13, $14, $15, $16, $17, $18, $19
+			$6, $7, $8, $9, $10, $11, $12,
+			$13, $14, $15, $16, $17, $18, $19, $20
 		) RETURNING *`,
 		checkout.ID, checkout.UserID, checkout.AccountID, checkout.CustomerID, checkout.SubscriptionID,
 		checkout.ProductID, checkout.Type, checkout.State, checkout.Amount, checkout.ReceivedAmount, checkout.LightningInvoice, checkout.BitcoinAddress,
-		checkout.Metadata, checkout.Items, checkout.Rates, checkout.ExpiresAt, checkout.CreatedAt, checkout.UpdatedAt, checkout.DeletedAt)
+		checkout.RedirectURL, checkout.Metadata, checkout.Items, checkout.Rates, checkout.ExpiresAt, checkout.CreatedAt, checkout.UpdatedAt, checkout.DeletedAt)
 	return checkout, err
 }
 
@@ -117,10 +118,10 @@ func (r *CheckoutRepository) Update(checkout *Checkout) error {
 	_, err := db.Exec(`
 		UPDATE checkouts SET 
 			type=$1, state=$2, received_amount=$3, lightning_invoice=$4, bitcoin_address=$5,
-			updated_at=$6
-		WHERE id=$7`,
+			redirect_url=$6, updated_at=$7
+		WHERE id=$8`,
 		checkout.Type, checkout.State, checkout.ReceivedAmount, checkout.LightningInvoice, checkout.BitcoinAddress,
-		checkout.UpdatedAt, checkout.ID)
+		checkout.RedirectURL, checkout.UpdatedAt, checkout.ID)
 	return err
 }
 
@@ -343,6 +344,7 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Type           CheckoutType     `json:"type"`
 		Amount         float64          `json:"amount" validate:"required_without=ProductID,gte=0"`
 		Currency       string           `json:"currency" validate:"required_without=ProductID"`
+		RedirectURL    *string          `json:"redirect_url"`
 		Metadata       *json.RawMessage `json:"metadata"`
 		Items          *json.RawMessage `json:"items"`
 		ExpiryMinutes  int              `json:"expiry_minutes"`
@@ -481,6 +483,7 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		SubscriptionID: input.SubscriptionID,
 		Type:           input.Type,
 		Amount:         satsAmount,
+		RedirectURL:    input.RedirectURL,
 		Metadata:       input.Metadata,
 		Items:          input.Items,
 		ExpiresAt:      time.Now().Add(time.Duration(expiryMinutes) * time.Minute),
