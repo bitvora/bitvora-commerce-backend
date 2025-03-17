@@ -214,7 +214,7 @@ var paymentLinkHandler = &PaymentLinkHandler{
 
 func (h *PaymentLinkHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		AccountID     uuid.UUID        `json:"account_id" validate:"required"`
+		AccountID     uuid.UUID        `json:"account_id"`
 		ProductID     *uuid.UUID       `json:"product_id"`
 		Amount        float64          `json:"amount" validate:"required_without=ProductID,gte=0"`
 		Currency      string           `json:"currency" validate:"required_without=ProductID"`
@@ -233,21 +233,48 @@ func (h *PaymentLinkHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if input.ExpiryMinutes <= 0 {
+		input.ExpiryMinutes = 1440 // Default to 24 hours if not specified
+	}
+
 	user, err := GetUserFromContext(r.Context())
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
 		return
 	}
 
-	account, err := accountService.Get(input.AccountID)
-	if err != nil {
-		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
-		return
-	}
+	var account *Account
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
 
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to create payment links for this account", nil)
-		return
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "payment_links", "create") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to create payment links", nil)
+			return
+		}
+
+		account, err = GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		input.AccountID = account.ID
+	} else {
+		if input.AccountID == uuid.Nil {
+			JsonResponse(w, http.StatusBadRequest, "Account ID is required", nil)
+			return
+		}
+
+		account, err = accountService.Get(input.AccountID)
+		if err != nil {
+			JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to create payment links for this account", nil)
+			return
+		}
 	}
 
 	// If there's a product ID associated, use its price and currency
@@ -268,17 +295,8 @@ func (h *PaymentLinkHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 		amount = product.Amount
 		currency = product.Currency
-	} else if input.Currency == "" || input.Amount == 0 {
-		JsonResponse(w, http.StatusBadRequest, "Amount and currency are required when no product is specified", nil)
-		return
 	}
 
-	expiryMinutes := 1440 // Default to 24 hours
-	if input.ExpiryMinutes > 0 {
-		expiryMinutes = input.ExpiryMinutes
-	}
-
-	// Create payment link
 	paymentLink := &PaymentLink{
 		ID:            uuid.New(),
 		UserID:        user.ID,
@@ -288,7 +306,7 @@ func (h *PaymentLinkHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Currency:      currency,
 		Metadata:      input.Metadata,
 		Items:         input.Items,
-		ExpiryMinutes: expiryMinutes,
+		ExpiryMinutes: input.ExpiryMinutes,
 	}
 
 	createdPaymentLink, err := paymentLinkService.Create(paymentLink)
@@ -320,9 +338,28 @@ func (h *PaymentLinkHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if paymentLink.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to access this payment link", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "payment_links", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read payment links", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if paymentLink.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This payment link belongs to a different account", nil)
+			return
+		}
+	} else {
+		if paymentLink.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to access this payment link", nil)
+			return
+		}
 	}
 
 	JsonResponse(w, http.StatusOK, "Payment link retrieved successfully", paymentLink)
@@ -362,9 +399,28 @@ func (h *PaymentLinkHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if paymentLink.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to update this payment link", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "payment_links", "update") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to update payment links", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if paymentLink.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This payment link belongs to a different account", nil)
+			return
+		}
+	} else {
+		if paymentLink.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to update this payment link", nil)
+			return
+		}
 	}
 
 	// If there's a product ID associated, use its price and currency
@@ -438,9 +494,28 @@ func (h *PaymentLinkHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if paymentLink.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to delete this payment link", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "payment_links", "delete") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to delete payment links", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if paymentLink.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This payment link belongs to a different account", nil)
+			return
+		}
+	} else {
+		if paymentLink.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to delete this payment link", nil)
+			return
+		}
 	}
 
 	err = paymentLinkService.Delete(id)
@@ -456,6 +531,29 @@ func (h *PaymentLinkHandler) List(w http.ResponseWriter, r *http.Request) {
 	user, err := GetUserFromContext(r.Context())
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "payment_links", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read payment links", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		paymentLinks, err := paymentLinkService.GetByAccount(account.ID)
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving payment links", err.Error())
+			return
+		}
+
+		JsonResponse(w, http.StatusOK, "Payment links retrieved successfully", paymentLinks)
 		return
 	}
 
@@ -482,15 +580,34 @@ func (h *PaymentLinkHandler) ListByAccount(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	account, err := accountService.Get(accountID)
-	if err != nil {
-		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
-		return
-	}
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "payment_links", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read payment links", nil)
+			return
+		}
 
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to access payment links for this account", nil)
-		return
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if accountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This account ID doesn't match the API key's account", nil)
+			return
+		}
+	} else {
+		account, err := accountService.Get(accountID)
+		if err != nil {
+			JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to access payment links for this account", nil)
+			return
+		}
 	}
 
 	paymentLinks, err := paymentLinkService.GetByAccount(accountID)
