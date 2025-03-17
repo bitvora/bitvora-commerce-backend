@@ -11,6 +11,7 @@ CREATE TABLE checkouts (
     received_amount BIGINT DEFAULT 0,
     lightning_invoice TEXT,
     bitcoin_address TEXT,
+    redirect_url TEXT,
     metadata JSONB,
     items JSONB,
     rates JSONB,
