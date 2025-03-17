@@ -137,7 +137,7 @@ var customerHandler = &CustomerHandler{
 
 func (h *CustomerHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		AccountID            uuid.UUID `json:"account_id" validate:"required"`
+		AccountID            uuid.UUID `json:"account_id"`
 		Name                 *string   `json:"name,omitempty"`
 		Email                *string   `json:"email,omitempty"`
 		Description          *string   `json:"description,omitempty"`
@@ -173,15 +173,38 @@ func (h *CustomerHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, err := accountService.Get(input.AccountID)
-	if err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
-		return
-	}
+	var account *Account
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
 
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to create customers for this account", nil)
-		return
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "customers", "create") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to create customers", nil)
+			return
+		}
+
+		account, err = GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		input.AccountID = account.ID
+	} else {
+		if input.AccountID == uuid.Nil {
+			JsonResponse(w, http.StatusBadRequest, "Account ID is required", nil)
+			return
+		}
+
+		account, err = accountService.Get(input.AccountID)
+		if err != nil {
+			JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to create customers for this account", nil)
+			return
+		}
 	}
 
 	customer := &Customer{
@@ -241,9 +264,28 @@ func (h *CustomerHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if existingCustomer.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to update this customer", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "customers", "update") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to update customers", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if existingCustomer.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This customer belongs to a different account", nil)
+			return
+		}
+	} else {
+		if existingCustomer.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to update this customer", nil)
+			return
+		}
 	}
 
 	var input struct {
@@ -328,9 +370,28 @@ func (h *CustomerHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if customer.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view this customer", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "customers", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read customers", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if customer.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This customer belongs to a different account", nil)
+			return
+		}
+	} else {
+		if customer.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view this customer", nil)
+			return
+		}
 	}
 
 	JsonResponse(w, http.StatusOK, "Customer retrieved successfully", customer)
@@ -340,6 +401,29 @@ func (h *CustomerHandler) GetAll(w http.ResponseWriter, r *http.Request) {
 	user, err := GetUserFromContext(r.Context())
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "customers", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read customers", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		customers, err := customerService.GetByAccount(account.ID)
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving customers", err.Error())
+			return
+		}
+
+		JsonResponse(w, http.StatusOK, "Customers retrieved successfully", customers)
 		return
 	}
 
@@ -366,15 +450,34 @@ func (h *CustomerHandler) GetByAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account, err := accountService.Get(accountID)
-	if err != nil {
-		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
-		return
-	}
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "customers", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to read customers", nil)
+			return
+		}
 
-	if account.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to view customers for this account", nil)
-		return
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if accountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This account ID doesn't match the API key's account", nil)
+			return
+		}
+	} else {
+		account, err := accountService.Get(accountID)
+		if err != nil {
+			JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to view customers for this account", nil)
+			return
+		}
 	}
 
 	customers, err := customerService.GetByAccount(accountID)
@@ -406,9 +509,28 @@ func (h *CustomerHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if customer.UserID != user.ID {
-		JsonResponse(w, http.StatusForbidden, "You are not authorized to delete this customer", nil)
-		return
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "customers", "delete") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to delete customers", nil)
+			return
+		}
+
+		account, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account", err.Error())
+			return
+		}
+
+		if customer.AccountID != account.ID {
+			JsonResponse(w, http.StatusForbidden, "This customer belongs to a different account", nil)
+			return
+		}
+	} else {
+		if customer.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to delete this customer", nil)
+			return
+		}
 	}
 
 	err = customerService.Delete(id)
