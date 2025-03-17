@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS payment_links (
     id UUID PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES users(id),
     account_id UUID NOT NULL REFERENCES accounts(id),
+    product_id UUID REFERENCES products(id),
     amount FLOAT NOT NULL,
     currency VARCHAR(10) NOT NULL,
     metadata JSONB,

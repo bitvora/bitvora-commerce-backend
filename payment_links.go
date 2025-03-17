@@ -15,6 +15,7 @@ type PaymentLink struct {
 	ID            uuid.UUID        `db:"id" json:"id"`
 	UserID        uuid.UUID        `db:"user_id" json:"user_id"`
 	AccountID     uuid.UUID        `db:"account_id" json:"account_id"`
+	ProductID     *uuid.UUID       `db:"product_id" json:"product_id,omitempty"`
 	Amount        float64          `db:"amount" json:"amount"`
 	Currency      string           `db:"currency" json:"currency"`
 	Metadata      *json.RawMessage `db:"metadata" json:"metadata,omitempty"`
@@ -53,13 +54,14 @@ type PaymentLinkRepository struct{}
 func (r *PaymentLinkRepository) Create(paymentLink *PaymentLink) (*PaymentLink, error) {
 	err := db.Get(paymentLink, `
 		INSERT INTO payment_links (
-			id, user_id, account_id, amount, currency,
+			id, user_id, account_id, product_id, amount, currency,
 			metadata, items, expiry_minutes, created_at, updated_at, deleted_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6,
-			$7, $8, $9, $10, $11
+			$7, $8, $9, $10, $11, $12
 		) RETURNING *`,
-		paymentLink.ID, paymentLink.UserID, paymentLink.AccountID, paymentLink.Amount, paymentLink.Currency,
+		paymentLink.ID, paymentLink.UserID, paymentLink.AccountID, paymentLink.ProductID,
+		paymentLink.Amount, paymentLink.Currency,
 		paymentLink.Metadata, paymentLink.Items, paymentLink.ExpiryMinutes,
 		paymentLink.CreatedAt, paymentLink.UpdatedAt, paymentLink.DeletedAt)
 	return paymentLink, err
@@ -86,10 +88,11 @@ func (r *PaymentLinkRepository) GetByAccount(accountID uuid.UUID) ([]*PaymentLin
 func (r *PaymentLinkRepository) Update(paymentLink *PaymentLink) error {
 	_, err := db.Exec(`
 		UPDATE payment_links SET 
-			amount=$1, currency=$2, metadata=$3, items=$4, 
-			expiry_minutes=$5, updated_at=$6
-		WHERE id=$7`,
-		paymentLink.Amount, paymentLink.Currency, paymentLink.Metadata, paymentLink.Items,
+			product_id=$1, amount=$2, currency=$3, metadata=$4, items=$5, 
+			expiry_minutes=$6, updated_at=$7
+		WHERE id=$8`,
+		paymentLink.ProductID, paymentLink.Amount, paymentLink.Currency,
+		paymentLink.Metadata, paymentLink.Items,
 		paymentLink.ExpiryMinutes, paymentLink.UpdatedAt, paymentLink.ID)
 	return err
 }
@@ -190,6 +193,7 @@ func (s *PaymentLinkService) CreateCheckoutFromLink(paymentLinkID uuid.UUID) (*C
 		ID:        uuid.New(),
 		UserID:    paymentLink.UserID,
 		AccountID: paymentLink.AccountID,
+		ProductID: paymentLink.ProductID,
 		Amount:    amountInSats, // Use converted amount
 		Metadata:  paymentLink.Metadata,
 		Items:     paymentLink.Items,
@@ -211,8 +215,9 @@ var paymentLinkHandler = &PaymentLinkHandler{
 func (h *PaymentLinkHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		AccountID     uuid.UUID        `json:"account_id" validate:"required"`
-		Amount        float64          `json:"amount" validate:"required,gte=0"`
-		Currency      string           `json:"currency" validate:"required"`
+		ProductID     *uuid.UUID       `json:"product_id"`
+		Amount        float64          `json:"amount" validate:"required_without=ProductID,gte=0"`
+		Currency      string           `json:"currency" validate:"required_without=ProductID"`
 		Metadata      *json.RawMessage `json:"metadata"`
 		Items         *json.RawMessage `json:"items"`
 		ExpiryMinutes int              `json:"expiry_minutes"`
@@ -245,17 +250,42 @@ func (h *PaymentLinkHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expiryMinutes := 1440
+	// If there's a product ID associated, use its price and currency
+	amount := input.Amount
+	currency := input.Currency
+
+	if input.ProductID != nil {
+		product, err := productService.Get(*input.ProductID)
+		if err != nil {
+			JsonResponse(w, http.StatusNotFound, "Product not found", err.Error())
+			return
+		}
+
+		if product.UserID != user.ID || product.AccountID != input.AccountID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to use this product", nil)
+			return
+		}
+
+		amount = product.Amount
+		currency = product.Currency
+	} else if input.Currency == "" || input.Amount == 0 {
+		JsonResponse(w, http.StatusBadRequest, "Amount and currency are required when no product is specified", nil)
+		return
+	}
+
+	expiryMinutes := 1440 // Default to 24 hours
 	if input.ExpiryMinutes > 0 {
 		expiryMinutes = input.ExpiryMinutes
 	}
-	// Create payment link without rates
+
+	// Create payment link
 	paymentLink := &PaymentLink{
 		ID:            uuid.New(),
 		UserID:        user.ID,
 		AccountID:     input.AccountID,
-		Amount:        input.Amount,
-		Currency:      input.Currency,
+		ProductID:     input.ProductID,
+		Amount:        amount,
+		Currency:      currency,
 		Metadata:      input.Metadata,
 		Items:         input.Items,
 		ExpiryMinutes: expiryMinutes,
@@ -307,19 +337,15 @@ func (h *PaymentLinkHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var input struct {
-		Amount        float64          `json:"amount" validate:"required,gte=0"`
-		Currency      string           `json:"currency" validate:"required"`
+		ProductID     *uuid.UUID       `json:"product_id"`
+		Amount        float64          `json:"amount" validate:"required_without=ProductID,gte=0"`
+		Currency      string           `json:"currency" validate:"required_without=ProductID"`
 		Metadata      *json.RawMessage `json:"metadata"`
 		Items         *json.RawMessage `json:"items"`
 		ExpiryMinutes int              `json:"expiry_minutes"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
-		return
-	}
-
-	if err := h.Validator.Struct(input); err != nil {
 		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
 		return
 	}
@@ -341,9 +367,42 @@ func (h *PaymentLinkHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If there's a product ID associated, use its price and currency
+	amount := input.Amount
+	currency := input.Currency
+
+	if input.ProductID != nil {
+		product, err := productService.Get(*input.ProductID)
+		if err != nil {
+			JsonResponse(w, http.StatusNotFound, "Product not found", err.Error())
+			return
+		}
+
+		if product.UserID != user.ID || product.AccountID != paymentLink.AccountID {
+			JsonResponse(w, http.StatusForbidden, "You are not authorized to use this product", nil)
+			return
+		}
+
+		amount = product.Amount
+		currency = product.Currency
+		paymentLink.ProductID = input.ProductID
+	} else if input.ProductID == nil && paymentLink.ProductID != nil {
+		// User is removing the product reference
+		paymentLink.ProductID = nil
+
+		// In this case, we need to ensure amount and currency are provided
+		if input.Currency == "" || input.Amount == 0 {
+			JsonResponse(w, http.StatusBadRequest, "Amount and currency are required when no product is specified", nil)
+			return
+		}
+
+		amount = input.Amount
+		currency = input.Currency
+	}
+
 	// Update the payment link fields
-	paymentLink.Amount = input.Amount
-	paymentLink.Currency = input.Currency
+	paymentLink.Amount = amount
+	paymentLink.Currency = currency
 	paymentLink.Metadata = input.Metadata
 	paymentLink.Items = input.Items
 	if input.ExpiryMinutes > 0 {
