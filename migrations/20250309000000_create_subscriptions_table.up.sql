@@ -8,6 +8,12 @@ CREATE TABLE subscriptions (
     product_id UUID NOT NULL REFERENCES products(id),
     billing_start_date TIMESTAMP NOT NULL,
     active_on_date TIMESTAMP NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'active',
+    next_billing_date TIMESTAMP NOT NULL,
+    last_payment_date TIMESTAMP,
+    last_payment_status VARCHAR(50),
+    failed_payment_attempts INT DEFAULT 0,
+    billing_interval_hours INT,
     metadata JSONB,
     nostr_relay VARCHAR(255),
     nostr_pubkey VARCHAR(255),
@@ -20,4 +26,6 @@ CREATE TABLE subscriptions (
 CREATE INDEX subscriptions_user_id_idx ON subscriptions(user_id);
 CREATE INDEX subscriptions_account_id_idx ON subscriptions(account_id);
 CREATE INDEX subscriptions_customer_id_idx ON subscriptions(customer_id);
-CREATE INDEX subscriptions_product_id_idx ON subscriptions(product_id); 
+CREATE INDEX subscriptions_product_id_idx ON subscriptions(product_id);
+CREATE INDEX subscriptions_next_billing_date_idx ON subscriptions(next_billing_date);
+CREATE INDEX subscriptions_status_idx ON subscriptions(status); 

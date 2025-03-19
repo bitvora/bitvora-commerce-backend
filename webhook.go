@@ -24,14 +24,11 @@ import (
 type WebhookEvent string
 
 const (
-	WebhookEventCheckoutCreated      WebhookEvent = "checkout.created"
-	WebhookEventCheckoutPaid         WebhookEvent = "checkout.paid"
-	WebhookEventCheckoutUnderpaid    WebhookEvent = "checkout.underpaid"
-	WebhookEventCheckoutOverpaid     WebhookEvent = "checkout.overpaid"
-	WebhookEventCheckoutExpired      WebhookEvent = "checkout.expired"
-	WebhookEventSubscriptionCreated  WebhookEvent = "subscription.created"
-	WebhookEventSubscriptionUpdated  WebhookEvent = "subscription.updated"
-	WebhookEventSubscriptionCanceled WebhookEvent = "subscription.canceled"
+	WebhookEventCheckoutCreated   WebhookEvent = "checkout.created"
+	WebhookEventCheckoutPaid      WebhookEvent = "checkout.paid"
+	WebhookEventCheckoutUnderpaid WebhookEvent = "checkout.underpaid"
+	WebhookEventCheckoutOverpaid  WebhookEvent = "checkout.overpaid"
+	WebhookEventCheckoutExpired   WebhookEvent = "checkout.expired"
 )
 
 var AllWebhookEvents = []WebhookEvent{
@@ -40,9 +37,6 @@ var AllWebhookEvents = []WebhookEvent{
 	WebhookEventCheckoutUnderpaid,
 	WebhookEventCheckoutOverpaid,
 	WebhookEventCheckoutExpired,
-	WebhookEventSubscriptionCreated,
-	WebhookEventSubscriptionUpdated,
-	WebhookEventSubscriptionCanceled,
 }
 
 // Custom type to handle JSONB for WebhookEvent

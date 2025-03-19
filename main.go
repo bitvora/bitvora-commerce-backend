@@ -40,6 +40,9 @@ func main() {
 	r := InitRoutes()
 	go walletListener.Start()
 
+	// Initialize the subscription scheduler
+	InitSubscriptionScheduler()
+
 	port := os.Getenv("APP_PORT")
 	if port == "" {
 		port = "2121"
