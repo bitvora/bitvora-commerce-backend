@@ -23,14 +23,11 @@ import (
 type NotificationEvent string
 
 const (
-	NotificationEventCheckoutCreated      NotificationEvent = "checkout.created"
-	NotificationEventCheckoutPaid         NotificationEvent = "checkout.paid"
-	NotificationEventCheckoutUnderpaid    NotificationEvent = "checkout.underpaid"
-	NotificationEventCheckoutOverpaid     NotificationEvent = "checkout.overpaid"
-	NotificationEventCheckoutExpired      NotificationEvent = "checkout.expired"
-	NotificationEventSubscriptionCreated  NotificationEvent = "subscription.created"
-	NotificationEventSubscriptionUpdated  NotificationEvent = "subscription.updated"
-	NotificationEventSubscriptionCanceled NotificationEvent = "subscription.canceled"
+	NotificationEventCheckoutCreated   NotificationEvent = "checkout.created"
+	NotificationEventCheckoutPaid      NotificationEvent = "checkout.paid"
+	NotificationEventCheckoutUnderpaid NotificationEvent = "checkout.underpaid"
+	NotificationEventCheckoutOverpaid  NotificationEvent = "checkout.overpaid"
+	NotificationEventCheckoutExpired   NotificationEvent = "checkout.expired"
 )
 
 var AllNotificationEvents = []NotificationEvent{
@@ -39,9 +36,6 @@ var AllNotificationEvents = []NotificationEvent{
 	NotificationEventCheckoutUnderpaid,
 	NotificationEventCheckoutOverpaid,
 	NotificationEventCheckoutExpired,
-	NotificationEventSubscriptionCreated,
-	NotificationEventSubscriptionUpdated,
-	NotificationEventSubscriptionCanceled,
 }
 
 type NotificationChannelType string
@@ -332,14 +326,11 @@ func (s *NotificationService) loadTemplates() {
 
 	// Load each template with the base template
 	templateFiles := map[NotificationEvent]string{
-		NotificationEventCheckoutCreated:      "checkout_created.html",
-		NotificationEventCheckoutPaid:         "checkout_paid.html",
-		NotificationEventCheckoutUnderpaid:    "checkout_underpaid.html",
-		NotificationEventCheckoutOverpaid:     "checkout_overpaid.html",
-		NotificationEventCheckoutExpired:      "checkout_expired.html",
-		NotificationEventSubscriptionCreated:  "subscription_created.html",
-		NotificationEventSubscriptionUpdated:  "subscription_updated.html",
-		NotificationEventSubscriptionCanceled: "subscription_canceled.html",
+		NotificationEventCheckoutCreated:   "checkout_created.html",
+		NotificationEventCheckoutPaid:      "checkout_paid.html",
+		NotificationEventCheckoutUnderpaid: "checkout_underpaid.html",
+		NotificationEventCheckoutOverpaid:  "checkout_overpaid.html",
+		NotificationEventCheckoutExpired:   "checkout_expired.html",
 	}
 
 	for event, filename := range templateFiles {
@@ -543,18 +534,6 @@ func (s *NotificationService) prepareTemplateData(event NotificationEvent, data 
 			templateData["Amount"] = float64(checkout.Amount) / 100000000
 			templateData["CreatedAt"] = checkout.CreatedAt.Format("January 2, 2006 at 3:04 PM")
 			templateData["UpdatedAt"] = checkout.UpdatedAt.Format("January 2, 2006 at 3:04 PM")
-		}
-
-	case NotificationEventSubscriptionCreated:
-		subscription, ok := data.(*Subscription)
-		if ok {
-			subject = "New Subscription Created"
-			templateData["Title"] = "New Subscription"
-			templateData["Subject"] = subject
-			templateData["SubscriptionID"] = subscription.ID.String()
-			templateData["Amount"] = float64(100) / 100000000
-			templateData["BillingCycle"] = subscription.BillingStartDate.Day()
-			templateData["CreatedAt"] = subscription.CreatedAt.Format("January 2, 2006 at 3:04 PM")
 		}
 
 	default:
