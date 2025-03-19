@@ -234,18 +234,32 @@ func (s *SubscriptionService) ProcessSubscriptionPayment(subscription *Subscript
 		return fmt.Errorf("failed to get seller wallet: %w", err)
 	}
 
-	expirySeconds := int64(60 * 60)
-	description := fmt.Sprintf("Subscription payment for %s", product.Name)
-	invoice, err := walletService.MakeInvoice(sellerWallet.ID, int64(product.Amount), description, expirySeconds)
-	if err != nil {
-		return fmt.Errorf("failed to create invoice: %w", err)
-	}
-
 	// Get current exchange rates
 	rates := fiatRateService.GetRates()
 	ratesJSON, err := json.Marshal(rates)
 	if err != nil {
 		return fmt.Errorf("failed to marshal rates: %w", err)
+	}
+
+	var amountSats int64
+	if product.Currency != "btc" && product.Currency != "sats" {
+		amountSats, err = fiatRateService.FiatToSatoshis(float64(product.Amount), product.Currency)
+		if err != nil {
+			return fmt.Errorf("failed to convert fiat to sats: %w", err)
+		}
+	} else {
+		if product.Currency == "btc" {
+			amountSats = int64(product.Amount * 100000000)
+		} else {
+			amountSats = int64(product.Amount)
+		}
+	}
+
+	expirySeconds := int64(60 * 60)
+	description := fmt.Sprintf("Subscription payment for %s", product.Name)
+	invoice, err := walletService.MakeInvoice(sellerWallet.ID, amountSats*1000, description, expirySeconds)
+	if err != nil {
+		return fmt.Errorf("failed to create invoice: %w", err)
 	}
 
 	// Create default empty JSON for metadata and items
@@ -261,7 +275,7 @@ func (s *SubscriptionService) ProcessSubscriptionPayment(subscription *Subscript
 		ProductID:        &subscription.ProductID,
 		Type:             CheckoutTypeSubscription, // Set proper type
 		State:            CheckoutStateOpen,
-		Amount:           int64(product.Amount),
+		Amount:           amountSats, // Use the converted amount in sats, not product.Amount
 		ReceivedAmount:   0,
 		LightningInvoice: &invoice,
 		Metadata:         &emptyJSON, // Initialize with empty JSON object
@@ -277,6 +291,7 @@ func (s *SubscriptionService) ProcessSubscriptionPayment(subscription *Subscript
 		return fmt.Errorf("failed to create checkout: %w", err)
 	}
 
+	// Pay the invoice
 	err = walletService.PayInvoiceWithConnection(
 		*subscription.NostrPubkey,
 		*subscription.NostrSecret,
@@ -291,20 +306,80 @@ func (s *SubscriptionService) ProcessSubscriptionPayment(subscription *Subscript
 		return fmt.Errorf("failed to pay invoice: %w", err)
 	}
 
-	go func() {
-		for i := 0; i < 20; i++ {
-			time.Sleep(3 * time.Second)
+	// Poll for payment confirmation - similar to ConnectWallet method
+	paymentSuccess := false
+	var paymentErr error
 
-			updatedCheckout, err := checkoutService.Get(checkout.ID)
+	// Poll up to 20 times with 3 second intervals (60 seconds total)
+	for i := 0; i < 20; i++ {
+		time.Sleep(3 * time.Second)
+
+		// Check if checkout state changed directly
+		updatedCheckout, err := checkoutService.Get(checkout.ID)
+		if err != nil {
+			continue
+		}
+
+		// If checkout was already updated by webhook or other process
+		if updatedCheckout.State == CheckoutStatePaid || updatedCheckout.State == CheckoutStateOverpaid {
+			paymentSuccess = true
+			break
+		}
+
+		// If not, check transactions directly
+		if updatedCheckout.LightningInvoice != nil && *updatedCheckout.LightningInvoice != "" {
+			responseData, err := walletService.ListTransactions(sellerWallet.ID, 0, 0, 50, 0, false, "incoming")
 			if err != nil {
+				logger.Error("Error listing transactions", "error", err)
 				continue
 			}
 
-			if updatedCheckout.State != CheckoutStateOpen {
-				break
+			var response TransactionResponse
+			if err := json.Unmarshal(responseData, &response); err != nil {
+				continue
+			}
+
+			if response.Error != nil {
+				continue
+			}
+
+			// Look for our invoice in the transactions
+			for _, tx := range response.Result.Transactions {
+				if tx.Invoice == *updatedCheckout.LightningInvoice && tx.SettledAt != nil && tx.Preimage != "" {
+					// Invoice has been paid, update the checkout state
+					newState := CheckoutStatePaid
+					receivedAmount := tx.Amount / 1000 // Convert from mSats to sats
+
+					if receivedAmount < updatedCheckout.Amount {
+						newState = CheckoutStateUnderpaid
+					} else if receivedAmount > updatedCheckout.Amount {
+						newState = CheckoutStateOverpaid
+					}
+
+					err = checkoutService.UpdateState(updatedCheckout.ID, newState, receivedAmount)
+					if err == nil && (newState == CheckoutStatePaid || newState == CheckoutStateOverpaid) {
+						paymentSuccess = true
+					} else if err != nil {
+						paymentErr = fmt.Errorf("failed to update checkout state: %w", err)
+					}
+					break // Exit the transaction loop as we've found our invoice
+				}
+			}
+
+			if paymentSuccess || paymentErr != nil {
+				break // Exit the polling loop
 			}
 		}
-	}()
+	}
+
+	// If we complete polling without confirming payment
+	if !paymentSuccess && paymentErr == nil {
+		paymentErr = fmt.Errorf("payment confirmation timed out")
+	}
+
+	if paymentErr != nil {
+		return paymentErr
+	}
 
 	return nil
 }
