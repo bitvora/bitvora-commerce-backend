@@ -87,6 +87,24 @@ type CustomerSummary struct {
 	DataPoints []CustomerDataPoint `json:"data_points"`
 }
 
+// SubscriberDataPoint represents a single data point for subscriber analytics
+type SubscriberDataPoint struct {
+	Date       time.Time `json:"date"`
+	Count      int       `json:"count"`
+	DayOfWeek  int       `json:"day_of_week"`
+	DayOfMonth int       `json:"day_of_month"`
+	Month      int       `json:"month"`
+	Year       int       `json:"year"`
+}
+
+// SubscriberSummary represents a summary of active subscribers for a given period
+type SubscriberSummary struct {
+	TotalCount int                   `json:"total_count"`
+	StartDate  time.Time             `json:"start_date"`
+	EndDate    time.Time             `json:"end_date"`
+	DataPoints []SubscriberDataPoint `json:"data_points"`
+}
+
 // DashboardRepository handles database operations for dashboard analytics
 type DashboardRepository struct{}
 
@@ -845,14 +863,14 @@ func (r *DashboardRepository) GetLast6MonthsNewCustomers(accountID uuid.UUID, en
 
 	rows, err := db.Query(`
 		SELECT 
-			TO_CHAR(DATE_TRUNC('month', created_at), 'YYYY-MM-DD') as month_start,
+			TO_CHAR(DATE_TRUNC('month', c.created_at), 'YYYY-MM-DD') as month_start,
 			COUNT(*) as count
-		FROM customers
+		FROM customers c
 		WHERE account_id = $1
 		AND created_at >= $2
 		AND created_at <= $3
 		AND deleted_at IS NULL
-		GROUP BY DATE_TRUNC('month', created_at)
+		GROUP BY DATE_TRUNC('month', c.created_at)
 		ORDER BY month_start`,
 		accountID, startOfPeriod, endOfMonth)
 
@@ -932,14 +950,14 @@ func (r *DashboardRepository) GetLast12MonthsNewCustomers(accountID uuid.UUID, e
 
 	rows, err := db.Query(`
 		SELECT 
-			TO_CHAR(DATE_TRUNC('month', created_at), 'YYYY-MM-DD') as month_start,
+			TO_CHAR(DATE_TRUNC('month', c.created_at), 'YYYY-MM-DD') as month_start,
 			COUNT(*) as count
-		FROM customers
+		FROM customers c
 		WHERE account_id = $1
 		AND created_at >= $2
 		AND created_at <= $3
 		AND deleted_at IS NULL
-		GROUP BY DATE_TRUNC('month', created_at)
+		GROUP BY DATE_TRUNC('month', c.created_at)
 		ORDER BY month_start`,
 		accountID, startOfPeriod, endOfMonth)
 
@@ -1016,17 +1034,17 @@ func (r *DashboardRepository) GetCustomersForDate(accountID uuid.UUID, date time
 
 	summary.TotalCount = totalCount
 
-	// This query now matches the structure of the working sales query
+	// Explicitly extract hour in UTC to ensure consistency
 	rows, err := db.Query(`
 		SELECT 
-			EXTRACT(HOUR FROM created_at) as hour,
+			EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC') as hour,
 			COUNT(*) as count
 		FROM customers
 		WHERE account_id = $1
 		AND created_at >= $2
 		AND created_at < $3
 		AND deleted_at IS NULL
-		GROUP BY EXTRACT(HOUR FROM created_at)
+		GROUP BY EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC')
 		ORDER BY hour`,
 		accountID, startOfDay, endOfDay)
 
@@ -1049,6 +1067,470 @@ func (r *DashboardRepository) GetCustomersForDate(accountID uuid.UUID, date time
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating through hourly new customers rows: %w", err)
+	}
+
+	return summary, nil
+}
+
+// GetLast7DaysActiveSubscribers retrieves active subscribers for the 7 days ending on the specified date
+func (r *DashboardRepository) GetLast7DaysActiveSubscribers(accountID uuid.UUID, endDate time.Time) (*SubscriberSummary, error) {
+	endOfDay := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 999999999, time.UTC)
+	startDate := endOfDay.AddDate(0, 0, -6)
+	startOfPeriod := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
+
+	summary := &SubscriberSummary{
+		StartDate:  startOfPeriod,
+		EndDate:    endOfDay,
+		DataPoints: make([]SubscriberDataPoint, 7),
+	}
+
+	for i := 0; i < 7; i++ {
+		dayDate := startOfPeriod.AddDate(0, 0, i)
+		summary.DataPoints[i] = SubscriberDataPoint{
+			Date:       dayDate,
+			Count:      0,
+			DayOfWeek:  int(dayDate.Weekday()),
+			DayOfMonth: dayDate.Day(),
+			Month:      int(dayDate.Month()),
+			Year:       dayDate.Year(),
+		}
+	}
+
+	var totalCount int
+	err := db.QueryRow(`
+		SELECT COUNT(DISTINCT c.customer_id)
+		FROM checkouts c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.account_id = $1
+		AND p.is_recurring = true
+		AND c.state IN ($2, $3)
+		AND c.created_at >= $4
+		AND c.created_at <= $5
+		AND c.customer_id IS NOT NULL
+		AND c.deleted_at IS NULL`,
+		accountID, CheckoutStatePaid, CheckoutStateOverpaid, startOfPeriod, endOfDay).
+		Scan(&totalCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying total active subscribers for 7 days: %w", err)
+	}
+
+	summary.TotalCount = totalCount
+
+	rows, err := db.Query(`
+		SELECT 
+			TO_CHAR(DATE(c.created_at), 'YYYY-MM-DD') as subscription_date,
+			COUNT(DISTINCT c.customer_id) as count
+		FROM checkouts c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.account_id = $1
+		AND p.is_recurring = true
+		AND c.state IN ($2, $3)
+		AND c.created_at >= $4
+		AND c.created_at <= $5
+		AND c.customer_id IS NOT NULL
+		AND c.deleted_at IS NULL
+		GROUP BY DATE(c.created_at)
+		ORDER BY subscription_date`,
+		accountID, CheckoutStatePaid, CheckoutStateOverpaid, startOfPeriod, endOfDay)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying daily active subscribers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var dateStr string
+		var count int
+		if err := rows.Scan(&dateStr, &count); err != nil {
+			return nil, fmt.Errorf("error scanning daily active subscribers row: %w", err)
+		}
+
+		date, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing date: %w", err)
+		}
+
+		for i := range summary.DataPoints {
+			if summary.DataPoints[i].Date.Format("2006-01-02") == date.Format("2006-01-02") {
+				summary.DataPoints[i].Count = count
+				break
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through daily active subscribers rows: %w", err)
+	}
+
+	return summary, nil
+}
+
+// GetLast30DaysActiveSubscribers retrieves active subscribers for the 30 days ending on the specified date
+func (r *DashboardRepository) GetLast30DaysActiveSubscribers(accountID uuid.UUID, endDate time.Time) (*SubscriberSummary, error) {
+	endOfDay := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 999999999, time.UTC)
+	startDate := endOfDay.AddDate(0, 0, -29)
+	startOfPeriod := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
+
+	summary := &SubscriberSummary{
+		StartDate:  startOfPeriod,
+		EndDate:    endOfDay,
+		DataPoints: make([]SubscriberDataPoint, 30),
+	}
+
+	for i := 0; i < 30; i++ {
+		dayDate := startOfPeriod.AddDate(0, 0, i)
+		summary.DataPoints[i] = SubscriberDataPoint{
+			Date:       dayDate,
+			Count:      0,
+			DayOfWeek:  int(dayDate.Weekday()),
+			DayOfMonth: dayDate.Day(),
+			Month:      int(dayDate.Month()),
+			Year:       dayDate.Year(),
+		}
+	}
+
+	var totalCount int
+	err := db.QueryRow(`
+		SELECT COUNT(DISTINCT c.customer_id)
+		FROM checkouts c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.account_id = $1
+		AND p.is_recurring = true
+		AND c.state IN ($2, $3)
+		AND c.created_at >= $4
+		AND c.created_at <= $5
+		AND c.customer_id IS NOT NULL
+		AND c.deleted_at IS NULL`,
+		accountID, CheckoutStatePaid, CheckoutStateOverpaid, startOfPeriod, endOfDay).
+		Scan(&totalCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying total active subscribers for 30 days: %w", err)
+	}
+
+	summary.TotalCount = totalCount
+
+	rows, err := db.Query(`
+		SELECT 
+			TO_CHAR(DATE(c.created_at), 'YYYY-MM-DD') as subscription_date,
+			COUNT(DISTINCT c.customer_id) as count
+		FROM checkouts c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.account_id = $1
+		AND p.is_recurring = true
+		AND c.state IN ($2, $3)
+		AND c.created_at >= $4
+		AND c.created_at <= $5
+		AND c.customer_id IS NOT NULL
+		AND c.deleted_at IS NULL
+		GROUP BY DATE(c.created_at)
+		ORDER BY subscription_date`,
+		accountID, CheckoutStatePaid, CheckoutStateOverpaid, startOfPeriod, endOfDay)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying daily active subscribers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var dateStr string
+		var count int
+		if err := rows.Scan(&dateStr, &count); err != nil {
+			return nil, fmt.Errorf("error scanning daily active subscribers row: %w", err)
+		}
+
+		date, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing date: %w", err)
+		}
+
+		for i := range summary.DataPoints {
+			if summary.DataPoints[i].Date.Format("2006-01-02") == date.Format("2006-01-02") {
+				summary.DataPoints[i].Count = count
+				break
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through daily active subscribers rows: %w", err)
+	}
+
+	return summary, nil
+}
+
+// GetLast6MonthsActiveSubscribers handles the request for the last 6 months' active subscriber data
+func (r *DashboardRepository) GetLast6MonthsActiveSubscribers(accountID uuid.UUID, endDate time.Time) (*SubscriberSummary, error) {
+	endOfMonth := time.Date(endDate.Year(), endDate.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0).Add(-time.Nanosecond)
+	startMonth := endOfMonth.AddDate(0, -5, 0)
+	startOfPeriod := time.Date(startMonth.Year(), startMonth.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	summary := &SubscriberSummary{
+		StartDate:  startOfPeriod,
+		EndDate:    endOfMonth,
+		DataPoints: make([]SubscriberDataPoint, 6),
+	}
+
+	for i := 0; i < 6; i++ {
+		monthDate := startOfPeriod.AddDate(0, i, 0)
+		summary.DataPoints[i] = SubscriberDataPoint{
+			Date:       monthDate,
+			Count:      0,
+			DayOfWeek:  int(monthDate.Weekday()),
+			DayOfMonth: monthDate.Day(),
+			Month:      int(monthDate.Month()),
+			Year:       monthDate.Year(),
+		}
+	}
+
+	var totalCount int
+	err := db.QueryRow(`
+		SELECT COUNT(DISTINCT c.customer_id)
+		FROM checkouts c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.account_id = $1
+		AND p.is_recurring = true
+		AND c.state IN ($2, $3)
+		AND c.created_at >= $4
+		AND c.created_at <= $5
+		AND c.customer_id IS NOT NULL
+		AND c.deleted_at IS NULL`,
+		accountID, CheckoutStatePaid, CheckoutStateOverpaid, startOfPeriod, endOfMonth).
+		Scan(&totalCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying total active subscribers for 6 months: %w", err)
+	}
+
+	summary.TotalCount = totalCount
+
+	rows, err := db.Query(`
+		SELECT 
+			TO_CHAR(DATE_TRUNC('month', c.created_at), 'YYYY-MM-DD') as month_start,
+			COUNT(DISTINCT c.customer_id) as count
+		FROM checkouts c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.account_id = $1
+		AND p.is_recurring = true
+		AND c.state IN ($2, $3)
+		AND c.created_at >= $4
+		AND c.created_at <= $5
+		AND c.customer_id IS NOT NULL
+		AND c.deleted_at IS NULL
+		GROUP BY DATE_TRUNC('month', c.created_at)
+		ORDER BY month_start`,
+		accountID, CheckoutStatePaid, CheckoutStateOverpaid, startOfPeriod, endOfMonth)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying monthly active subscribers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var monthStr string
+		var count int
+		if err := rows.Scan(&monthStr, &count); err != nil {
+			return nil, fmt.Errorf("error scanning monthly active subscribers row: %w", err)
+		}
+
+		monthDate, err := time.Parse("2006-01-02", monthStr)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing month date: %w", err)
+		}
+
+		for i := range summary.DataPoints {
+			if summary.DataPoints[i].Date.Month() == monthDate.Month() &&
+				summary.DataPoints[i].Date.Year() == monthDate.Year() {
+				summary.DataPoints[i].Count = count
+				break
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through monthly active subscribers rows: %w", err)
+	}
+
+	return summary, nil
+}
+
+// GetLast12MonthsActiveSubscribers handles the request for the last 12 months' active subscriber data
+func (r *DashboardRepository) GetLast12MonthsActiveSubscribers(accountID uuid.UUID, endDate time.Time) (*SubscriberSummary, error) {
+	endOfMonth := time.Date(endDate.Year(), endDate.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0).Add(-time.Nanosecond)
+	startMonth := endOfMonth.AddDate(0, -11, 0)
+	startOfPeriod := time.Date(startMonth.Year(), startMonth.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	summary := &SubscriberSummary{
+		StartDate:  startOfPeriod,
+		EndDate:    endOfMonth,
+		DataPoints: make([]SubscriberDataPoint, 12),
+	}
+
+	for i := 0; i < 12; i++ {
+		monthDate := startOfPeriod.AddDate(0, i, 0)
+		summary.DataPoints[i] = SubscriberDataPoint{
+			Date:       monthDate,
+			Count:      0,
+			DayOfWeek:  int(monthDate.Weekday()),
+			DayOfMonth: monthDate.Day(),
+			Month:      int(monthDate.Month()),
+			Year:       monthDate.Year(),
+		}
+	}
+
+	var totalCount int
+	err := db.QueryRow(`
+		SELECT COUNT(DISTINCT c.customer_id)
+		FROM checkouts c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.account_id = $1
+		AND p.is_recurring = true
+		AND c.state IN ($2, $3)
+		AND c.created_at >= $4
+		AND c.created_at <= $5
+		AND c.customer_id IS NOT NULL
+		AND c.deleted_at IS NULL`,
+		accountID, CheckoutStatePaid, CheckoutStateOverpaid, startOfPeriod, endOfMonth).
+		Scan(&totalCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying total active subscribers for 12 months: %w", err)
+	}
+
+	summary.TotalCount = totalCount
+
+	rows, err := db.Query(`
+		SELECT 
+			TO_CHAR(DATE_TRUNC('month', c.created_at), 'YYYY-MM-DD') as month_start,
+			COUNT(DISTINCT c.customer_id) as count
+		FROM checkouts c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.account_id = $1
+		AND p.is_recurring = true
+		AND c.state IN ($2, $3)
+		AND c.created_at >= $4
+		AND c.created_at <= $5
+		AND c.customer_id IS NOT NULL
+		AND c.deleted_at IS NULL
+		GROUP BY DATE_TRUNC('month', c.created_at)
+		ORDER BY month_start`,
+		accountID, CheckoutStatePaid, CheckoutStateOverpaid, startOfPeriod, endOfMonth)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying monthly active subscribers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var monthStr string
+		var count int
+		if err := rows.Scan(&monthStr, &count); err != nil {
+			return nil, fmt.Errorf("error scanning monthly active subscribers row: %w", err)
+		}
+
+		monthDate, err := time.Parse("2006-01-02", monthStr)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing month date: %w", err)
+		}
+
+		for i := range summary.DataPoints {
+			if summary.DataPoints[i].Date.Month() == monthDate.Month() &&
+				summary.DataPoints[i].Date.Year() == monthDate.Year() {
+				summary.DataPoints[i].Count = count
+				break
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through monthly active subscribers rows: %w", err)
+	}
+
+	return summary, nil
+}
+
+// GetActiveSubscribersForDate retrieves active subscriber data for a specific date, grouped by hour
+func (r *DashboardRepository) GetActiveSubscribersForDate(accountID uuid.UUID, date time.Time) (*SubscriberSummary, error) {
+	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
+	endOfDay := startOfDay.Add(24 * time.Hour)
+
+	summary := &SubscriberSummary{
+		StartDate:  startOfDay,
+		EndDate:    endOfDay,
+		DataPoints: make([]SubscriberDataPoint, 24),
+	}
+
+	for i := 0; i < 24; i++ {
+		hourTime := startOfDay.Add(time.Duration(i) * time.Hour)
+		summary.DataPoints[i] = SubscriberDataPoint{
+			Date:       hourTime,
+			Count:      0,
+			DayOfWeek:  int(hourTime.Weekday()),
+			DayOfMonth: hourTime.Day(),
+			Month:      int(hourTime.Month()),
+			Year:       hourTime.Year(),
+		}
+	}
+
+	var totalCount int
+	err := db.QueryRow(`
+		SELECT COUNT(DISTINCT c.customer_id)
+		FROM checkouts c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.account_id = $1
+		AND p.is_recurring = true
+		AND c.state IN ($2, $3)
+		AND c.created_at >= $4
+		AND c.created_at < $5
+		AND c.customer_id IS NOT NULL
+		AND c.deleted_at IS NULL`,
+		accountID, CheckoutStatePaid, CheckoutStateOverpaid, startOfDay, endOfDay).
+		Scan(&totalCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying total active subscribers for day: %w", err)
+	}
+
+	summary.TotalCount = totalCount
+
+	// Explicitly extract hour in UTC to ensure consistency
+	rows, err := db.Query(`
+		SELECT 
+			EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'UTC') as hour,
+			COUNT(DISTINCT c.customer_id) as count
+		FROM checkouts c
+		JOIN products p ON c.product_id = p.id
+		WHERE c.account_id = $1
+		AND p.is_recurring = true
+		AND c.state IN ($2, $3)
+		AND c.created_at >= $4
+		AND c.created_at < $5
+		AND c.customer_id IS NOT NULL
+		AND c.deleted_at IS NULL
+		GROUP BY EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'UTC')
+		ORDER BY hour`,
+		accountID, CheckoutStatePaid, CheckoutStateOverpaid, startOfDay, endOfDay)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying hourly active subscribers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var hour int
+		var count int
+		if err := rows.Scan(&hour, &count); err != nil {
+			return nil, fmt.Errorf("error scanning hourly active subscribers row: %w", err)
+		}
+
+		if hour >= 0 && hour < 24 {
+			summary.DataPoints[hour].Count = count
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through hourly active subscribers rows: %w", err)
 	}
 
 	return summary, nil
@@ -1119,6 +1601,93 @@ func (s *DashboardService) GetLast12MonthsNewCustomers(accountID uuid.UUID, endD
 // GetCustomersForDate retrieves customer data for a specific date, grouped by hour
 func (s *DashboardService) GetCustomersForDate(accountID uuid.UUID, date time.Time) (*CustomerSummary, error) {
 	return s.repository.GetCustomersForDate(accountID, date)
+}
+
+// GetLast7DaysActiveSubscribers retrieves active subscribers for the 7 days ending on the specified date
+func (s *DashboardService) GetLast7DaysActiveSubscribers(accountID uuid.UUID, endDate time.Time) (*SubscriberSummary, error) {
+	return s.repository.GetLast7DaysActiveSubscribers(accountID, endDate)
+}
+
+// GetLast30DaysActiveSubscribers retrieves active subscribers for the 30 days ending on the specified date
+func (s *DashboardService) GetLast30DaysActiveSubscribers(accountID uuid.UUID, endDate time.Time) (*SubscriberSummary, error) {
+	return s.repository.GetLast30DaysActiveSubscribers(accountID, endDate)
+}
+
+// GetLast6MonthsActiveSubscribers handles the request for the last 6 months' active subscriber data
+func (s *DashboardService) GetLast6MonthsActiveSubscribers(accountID uuid.UUID, endDate time.Time) (*SubscriberSummary, error) {
+	return s.repository.GetLast6MonthsActiveSubscribers(accountID, endDate)
+}
+
+// GetLast12MonthsActiveSubscribers handles the request for the last 12 months' active subscriber data
+func (s *DashboardService) GetLast12MonthsActiveSubscribers(accountID uuid.UUID, endDate time.Time) (*SubscriberSummary, error) {
+	return s.repository.GetLast12MonthsActiveSubscribers(accountID, endDate)
+}
+
+// GetActiveSubscribersForDate retrieves active subscriber data for a specific date
+func (s *DashboardService) GetActiveSubscribersForDate(accountID uuid.UUID, date time.Time) (*SubscriberSummary, error) {
+	return s.repository.GetActiveSubscribersForDate(accountID, date)
+}
+
+// GetDailyActiveSubscribers handles the request for a specific date's active subscriber data
+func (h *DashboardHandler) GetDailyActiveSubscribers(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountID")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	dateStr := chi.URLParam(r, "date")
+	date, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
+			return
+		}
+	}
+
+	summary, err := dashboardService.GetActiveSubscribersForDate(accountID, date)
+	if err != nil {
+		logger.Error("Error getting daily active subscribers", "error", err, "account_id", accountID, "date", dateStr)
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving active subscriber data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, fmt.Sprintf("Active subscriber data for %s retrieved successfully", dateStr), summary)
 }
 
 // DashboardHandler handles HTTP requests for dashboard operations
@@ -1776,6 +2345,254 @@ func (h *DashboardHandler) GetDailyCustomers(w http.ResponseWriter, r *http.Requ
 	}
 
 	JsonResponse(w, http.StatusOK, fmt.Sprintf("New customer data for %s retrieved successfully", dateStr), summary)
+}
+
+// GetLast7DaysActiveSubscribers handles the request for the last 7 days' active subscriber data
+func (h *DashboardHandler) GetLast7DaysActiveSubscribers(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountID")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	dateStr := chi.URLParam(r, "date")
+	endDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
+			return
+		}
+	}
+
+	summary, err := dashboardService.GetLast7DaysActiveSubscribers(accountID, endDate)
+	if err != nil {
+		logger.Error("Error getting last 7 days active subscribers", "error", err, "account_id", accountID, "end_date", dateStr)
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving active subscriber data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, fmt.Sprintf("Last 7 days active subscriber data ending on %s retrieved successfully", dateStr), summary)
+}
+
+// GetLast30DaysActiveSubscribers handles the request for the last 30 days' active subscriber data
+func (h *DashboardHandler) GetLast30DaysActiveSubscribers(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountID")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	dateStr := chi.URLParam(r, "date")
+	endDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
+			return
+		}
+	}
+
+	summary, err := dashboardService.GetLast30DaysActiveSubscribers(accountID, endDate)
+	if err != nil {
+		logger.Error("Error getting last 30 days active subscribers", "error", err, "account_id", accountID, "end_date", dateStr)
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving active subscriber data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, fmt.Sprintf("Last 30 days active subscriber data ending on %s retrieved successfully", dateStr), summary)
+}
+
+// GetLast6MonthsActiveSubscribers handles the request for the last 6 months' active subscriber data
+func (h *DashboardHandler) GetLast6MonthsActiveSubscribers(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountID")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	dateStr := chi.URLParam(r, "date")
+	endDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
+			return
+		}
+	}
+
+	summary, err := dashboardService.GetLast6MonthsActiveSubscribers(accountID, endDate)
+	if err != nil {
+		logger.Error("Error getting last 6 months active subscribers", "error", err, "account_id", accountID, "end_date", dateStr)
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving active subscriber data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, fmt.Sprintf("Last 6 months active subscriber data ending on %s retrieved successfully", dateStr), summary)
+}
+
+// GetLast12MonthsActiveSubscribers handles the request for the last 12 months' active subscriber data
+func (h *DashboardHandler) GetLast12MonthsActiveSubscribers(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountID")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	dateStr := chi.URLParam(r, "date")
+	endDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
+			return
+		}
+	}
+
+	summary, err := dashboardService.GetLast12MonthsActiveSubscribers(accountID, endDate)
+	if err != nil {
+		logger.Error("Error getting last 12 months active subscribers", "error", err, "account_id", accountID, "end_date", dateStr)
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving active subscriber data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, fmt.Sprintf("Last 12 months active subscriber data ending on %s retrieved successfully", dateStr), summary)
 }
 
 // Setup global handler instance
