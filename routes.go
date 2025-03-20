@@ -44,6 +44,12 @@ func InitRoutes() http.Handler {
 		r.Get("/account/{id}", accountHandler.Get)
 		r.Delete("/account/{id}", accountHandler.Delete)
 
+		r.Get("/dashboard/{accountID}/sales/daily/{date}", dashboardHandler.GetDailySales)
+		r.Get("/dashboard/{accountID}/sales/7-days/{date}", dashboardHandler.GetLast7DaysSales)
+		r.Get("/dashboard/{accountID}/sales/30-days/{date}", dashboardHandler.GetLast30DaysSales)
+		r.Get("/dashboard/{accountID}/sales/6-months/{date}", dashboardHandler.GetLast6MonthsSales)
+		r.Get("/dashboard/{accountID}/sales/12-months/{date}", dashboardHandler.GetLast12MonthsSales)
+
 		r.Route("/api-key", func(r chi.Router) {
 			r.Post("/", apiKeyHandler.Create)
 			r.Get("/", apiKeyHandler.GetAll)
