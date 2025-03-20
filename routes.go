@@ -139,6 +139,12 @@ func InitRoutes() http.Handler {
 			r.Get("/convert/to-fiat/{currency}", fiatHandler.ConvertSatoshisToFiat)
 			r.Get("/convert/to-sats/{currency}", fiatHandler.ConvertFiatToSatoshis)
 		})
+
+		r.Get("/dashboard/{accountID}/mrr/7-days/{date}", dashboardHandler.GetLast7DaysMRR)
+		r.Get("/dashboard/{accountID}/mrr/30-days/{date}", dashboardHandler.GetLast30DaysMRR)
+		r.Get("/dashboard/{accountID}/mrr/6-months/{date}", dashboardHandler.GetLast6MonthsMRR)
+		r.Get("/dashboard/{accountID}/mrr/12-months/{date}", dashboardHandler.GetLast12MonthsMRR)
+		r.Get("/dashboard/{accountID}/mrr/daily/{date}", dashboardHandler.GetDailyMRR)
 	})
 
 	return r
