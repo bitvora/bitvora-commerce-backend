@@ -69,6 +69,24 @@ type MonthlySalesSummary struct {
 	DataPoints  []MonthlySalesDataPoint `json:"data_points"`
 }
 
+// CustomerDataPoint represents a single data point for customer analytics
+type CustomerDataPoint struct {
+	Date       time.Time `json:"date"`
+	Count      int       `json:"count"`
+	DayOfWeek  int       `json:"day_of_week"`
+	DayOfMonth int       `json:"day_of_month"`
+	Month      int       `json:"month"`
+	Year       int       `json:"year"`
+}
+
+// CustomerSummary represents a summary of new customers for a given period
+type CustomerSummary struct {
+	TotalCount int                 `json:"total_count"`
+	StartDate  time.Time           `json:"start_date"`
+	EndDate    time.Time           `json:"end_date"`
+	DataPoints []CustomerDataPoint `json:"data_points"`
+}
+
 // DashboardRepository handles database operations for dashboard analytics
 type DashboardRepository struct{}
 
@@ -612,6 +630,430 @@ func (r *DashboardRepository) GetLast12MonthsSales(accountID uuid.UUID, endDate 
 	return summary, nil
 }
 
+// GetLast7DaysNewCustomers retrieves new customers for the 7 days ending on the specified date
+func (r *DashboardRepository) GetLast7DaysNewCustomers(accountID uuid.UUID, endDate time.Time) (*CustomerSummary, error) {
+	endOfDay := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 999999999, time.UTC)
+	startDate := endOfDay.AddDate(0, 0, -6)
+	startOfPeriod := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
+
+	summary := &CustomerSummary{
+		StartDate:  startOfPeriod,
+		EndDate:    endOfDay,
+		DataPoints: make([]CustomerDataPoint, 7),
+	}
+
+	for i := 0; i < 7; i++ {
+		dayDate := startOfPeriod.AddDate(0, 0, i)
+		summary.DataPoints[i] = CustomerDataPoint{
+			Date:       dayDate,
+			Count:      0,
+			DayOfWeek:  int(dayDate.Weekday()),
+			DayOfMonth: dayDate.Day(),
+			Month:      int(dayDate.Month()),
+			Year:       dayDate.Year(),
+		}
+	}
+
+	var totalCount int
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM customers
+		WHERE account_id = $1
+		AND created_at >= $2
+		AND created_at <= $3
+		AND deleted_at IS NULL`,
+		accountID, startOfPeriod, endOfDay).
+		Scan(&totalCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying total new customers for 7 days: %w", err)
+	}
+
+	summary.TotalCount = totalCount
+
+	rows, err := db.Query(`
+		SELECT 
+			TO_CHAR(DATE(created_at), 'YYYY-MM-DD') as creation_date,
+			COUNT(*) as count
+		FROM customers
+		WHERE account_id = $1
+		AND created_at >= $2
+		AND created_at <= $3
+		AND deleted_at IS NULL
+		GROUP BY DATE(created_at)
+		ORDER BY creation_date`,
+		accountID, startOfPeriod, endOfDay)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying daily new customers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var dateStr string
+		var count int
+		if err := rows.Scan(&dateStr, &count); err != nil {
+			return nil, fmt.Errorf("error scanning daily new customers row: %w", err)
+		}
+
+		date, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing date: %w", err)
+		}
+
+		for i := range summary.DataPoints {
+			if summary.DataPoints[i].Date.Format("2006-01-02") == date.Format("2006-01-02") {
+				summary.DataPoints[i].Count = count
+				break
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through daily new customers rows: %w", err)
+	}
+
+	return summary, nil
+}
+
+// GetLast30DaysNewCustomers retrieves new customers for the 30 days ending on the specified date
+func (r *DashboardRepository) GetLast30DaysNewCustomers(accountID uuid.UUID, endDate time.Time) (*CustomerSummary, error) {
+	endOfDay := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 999999999, time.UTC)
+	startDate := endOfDay.AddDate(0, 0, -29)
+	startOfPeriod := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
+
+	summary := &CustomerSummary{
+		StartDate:  startOfPeriod,
+		EndDate:    endOfDay,
+		DataPoints: make([]CustomerDataPoint, 30),
+	}
+
+	for i := 0; i < 30; i++ {
+		dayDate := startOfPeriod.AddDate(0, 0, i)
+		summary.DataPoints[i] = CustomerDataPoint{
+			Date:       dayDate,
+			Count:      0,
+			DayOfWeek:  int(dayDate.Weekday()),
+			DayOfMonth: dayDate.Day(),
+			Month:      int(dayDate.Month()),
+			Year:       dayDate.Year(),
+		}
+	}
+
+	var totalCount int
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM customers
+		WHERE account_id = $1
+		AND created_at >= $2
+		AND created_at <= $3
+		AND deleted_at IS NULL`,
+		accountID, startOfPeriod, endOfDay).
+		Scan(&totalCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying total new customers for 30 days: %w", err)
+	}
+
+	summary.TotalCount = totalCount
+
+	rows, err := db.Query(`
+		SELECT 
+			TO_CHAR(DATE(created_at), 'YYYY-MM-DD') as creation_date,
+			COUNT(*) as count
+		FROM customers
+		WHERE account_id = $1
+		AND created_at >= $2
+		AND created_at <= $3
+		AND deleted_at IS NULL
+		GROUP BY DATE(created_at)
+		ORDER BY creation_date`,
+		accountID, startOfPeriod, endOfDay)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying daily new customers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var dateStr string
+		var count int
+		if err := rows.Scan(&dateStr, &count); err != nil {
+			return nil, fmt.Errorf("error scanning daily new customers row: %w", err)
+		}
+
+		date, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing date: %w", err)
+		}
+
+		for i := range summary.DataPoints {
+			if summary.DataPoints[i].Date.Format("2006-01-02") == date.Format("2006-01-02") {
+				summary.DataPoints[i].Count = count
+				break
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through daily new customers rows: %w", err)
+	}
+
+	return summary, nil
+}
+
+// GetLast6MonthsNewCustomers retrieves new customers for the 6 months ending on the specified date
+func (r *DashboardRepository) GetLast6MonthsNewCustomers(accountID uuid.UUID, endDate time.Time) (*CustomerSummary, error) {
+	endOfMonth := time.Date(endDate.Year(), endDate.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0).Add(-time.Nanosecond)
+	startMonth := endOfMonth.AddDate(0, -5, 0)
+	startOfPeriod := time.Date(startMonth.Year(), startMonth.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	summary := &CustomerSummary{
+		StartDate:  startOfPeriod,
+		EndDate:    endOfMonth,
+		DataPoints: make([]CustomerDataPoint, 6),
+	}
+
+	for i := 0; i < 6; i++ {
+		monthDate := startOfPeriod.AddDate(0, i, 0)
+		summary.DataPoints[i] = CustomerDataPoint{
+			Date:       monthDate,
+			Count:      0,
+			DayOfWeek:  int(monthDate.Weekday()),
+			DayOfMonth: monthDate.Day(),
+			Month:      int(monthDate.Month()),
+			Year:       monthDate.Year(),
+		}
+	}
+
+	var totalCount int
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM customers
+		WHERE account_id = $1
+		AND created_at >= $2
+		AND created_at <= $3
+		AND deleted_at IS NULL`,
+		accountID, startOfPeriod, endOfMonth).
+		Scan(&totalCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying total new customers for 6 months: %w", err)
+	}
+
+	summary.TotalCount = totalCount
+
+	rows, err := db.Query(`
+		SELECT 
+			TO_CHAR(DATE_TRUNC('month', created_at), 'YYYY-MM-DD') as month_start,
+			COUNT(*) as count
+		FROM customers
+		WHERE account_id = $1
+		AND created_at >= $2
+		AND created_at <= $3
+		AND deleted_at IS NULL
+		GROUP BY DATE_TRUNC('month', created_at)
+		ORDER BY month_start`,
+		accountID, startOfPeriod, endOfMonth)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying monthly new customers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var monthStr string
+		var count int
+		if err := rows.Scan(&monthStr, &count); err != nil {
+			return nil, fmt.Errorf("error scanning monthly new customers row: %w", err)
+		}
+
+		monthDate, err := time.Parse("2006-01-02", monthStr)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing month date: %w", err)
+		}
+
+		for i := range summary.DataPoints {
+			if summary.DataPoints[i].Date.Month() == monthDate.Month() &&
+				summary.DataPoints[i].Date.Year() == monthDate.Year() {
+				summary.DataPoints[i].Count = count
+				break
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through monthly new customers rows: %w", err)
+	}
+
+	return summary, nil
+}
+
+// GetLast12MonthsNewCustomers retrieves new customers for the 12 months ending on the specified date
+func (r *DashboardRepository) GetLast12MonthsNewCustomers(accountID uuid.UUID, endDate time.Time) (*CustomerSummary, error) {
+	endOfMonth := time.Date(endDate.Year(), endDate.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0).Add(-time.Nanosecond)
+	startMonth := endOfMonth.AddDate(0, -11, 0)
+	startOfPeriod := time.Date(startMonth.Year(), startMonth.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	summary := &CustomerSummary{
+		StartDate:  startOfPeriod,
+		EndDate:    endOfMonth,
+		DataPoints: make([]CustomerDataPoint, 12),
+	}
+
+	for i := 0; i < 12; i++ {
+		monthDate := startOfPeriod.AddDate(0, i, 0)
+		summary.DataPoints[i] = CustomerDataPoint{
+			Date:       monthDate,
+			Count:      0,
+			DayOfWeek:  int(monthDate.Weekday()),
+			DayOfMonth: monthDate.Day(),
+			Month:      int(monthDate.Month()),
+			Year:       monthDate.Year(),
+		}
+	}
+
+	var totalCount int
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM customers
+		WHERE account_id = $1
+		AND created_at >= $2
+		AND created_at <= $3
+		AND deleted_at IS NULL`,
+		accountID, startOfPeriod, endOfMonth).
+		Scan(&totalCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying total new customers for 12 months: %w", err)
+	}
+
+	summary.TotalCount = totalCount
+
+	rows, err := db.Query(`
+		SELECT 
+			TO_CHAR(DATE_TRUNC('month', created_at), 'YYYY-MM-DD') as month_start,
+			COUNT(*) as count
+		FROM customers
+		WHERE account_id = $1
+		AND created_at >= $2
+		AND created_at <= $3
+		AND deleted_at IS NULL
+		GROUP BY DATE_TRUNC('month', created_at)
+		ORDER BY month_start`,
+		accountID, startOfPeriod, endOfMonth)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying monthly new customers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var monthStr string
+		var count int
+		if err := rows.Scan(&monthStr, &count); err != nil {
+			return nil, fmt.Errorf("error scanning monthly new customers row: %w", err)
+		}
+
+		monthDate, err := time.Parse("2006-01-02", monthStr)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing month date: %w", err)
+		}
+
+		for i := range summary.DataPoints {
+			if summary.DataPoints[i].Date.Month() == monthDate.Month() &&
+				summary.DataPoints[i].Date.Year() == monthDate.Year() {
+				summary.DataPoints[i].Count = count
+				break
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through monthly new customers rows: %w", err)
+	}
+
+	return summary, nil
+}
+
+// GetCustomersForDate retrieves customer data for a specific date, grouped by hour
+func (r *DashboardRepository) GetCustomersForDate(accountID uuid.UUID, date time.Time) (*CustomerSummary, error) {
+	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
+	endOfDay := startOfDay.Add(24 * time.Hour)
+
+	summary := &CustomerSummary{
+		StartDate:  startOfDay,
+		EndDate:    endOfDay,
+		DataPoints: make([]CustomerDataPoint, 24),
+	}
+
+	for i := 0; i < 24; i++ {
+		hourTime := startOfDay.Add(time.Duration(i) * time.Hour)
+		summary.DataPoints[i] = CustomerDataPoint{
+			Date:       hourTime,
+			Count:      0,
+			DayOfWeek:  int(hourTime.Weekday()),
+			DayOfMonth: hourTime.Day(),
+			Month:      int(hourTime.Month()),
+			Year:       hourTime.Year(),
+		}
+	}
+
+	var totalCount int
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM customers
+		WHERE account_id = $1
+		AND created_at >= $2
+		AND created_at < $3
+		AND deleted_at IS NULL`,
+		accountID, startOfDay, endOfDay).
+		Scan(&totalCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying total new customers for day: %w", err)
+	}
+
+	summary.TotalCount = totalCount
+
+	// This query now matches the structure of the working sales query
+	rows, err := db.Query(`
+		SELECT 
+			EXTRACT(HOUR FROM created_at) as hour,
+			COUNT(*) as count
+		FROM customers
+		WHERE account_id = $1
+		AND created_at >= $2
+		AND created_at < $3
+		AND deleted_at IS NULL
+		GROUP BY EXTRACT(HOUR FROM created_at)
+		ORDER BY hour`,
+		accountID, startOfDay, endOfDay)
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying hourly new customers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var hour int
+		var count int
+		if err := rows.Scan(&hour, &count); err != nil {
+			return nil, fmt.Errorf("error scanning hourly new customers row: %w", err)
+		}
+
+		if hour >= 0 && hour < 24 {
+			summary.DataPoints[hour].Count = count
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through hourly new customers rows: %w", err)
+	}
+
+	return summary, nil
+}
+
 // DashboardService provides business logic for dashboard operations
 type DashboardService struct {
 	repository *DashboardRepository
@@ -654,6 +1096,31 @@ func (s *DashboardService) GetLast12MonthsSales(accountID uuid.UUID, endDate tim
 	return s.repository.GetLast12MonthsSales(accountID, endDate)
 }
 
+// GetLast7DaysNewCustomers retrieves new customer data for the last 7 days ending on the specified date
+func (s *DashboardService) GetLast7DaysNewCustomers(accountID uuid.UUID, endDate time.Time) (*CustomerSummary, error) {
+	return s.repository.GetLast7DaysNewCustomers(accountID, endDate)
+}
+
+// GetLast30DaysNewCustomers retrieves new customer data for the last 30 days ending on the specified date
+func (s *DashboardService) GetLast30DaysNewCustomers(accountID uuid.UUID, endDate time.Time) (*CustomerSummary, error) {
+	return s.repository.GetLast30DaysNewCustomers(accountID, endDate)
+}
+
+// GetLast6MonthsNewCustomers retrieves new customers for the 6 months ending on the specified date
+func (s *DashboardService) GetLast6MonthsNewCustomers(accountID uuid.UUID, endDate time.Time) (*CustomerSummary, error) {
+	return s.repository.GetLast6MonthsNewCustomers(accountID, endDate)
+}
+
+// GetLast12MonthsNewCustomers retrieves new customers for the 12 months ending on the specified date
+func (s *DashboardService) GetLast12MonthsNewCustomers(accountID uuid.UUID, endDate time.Time) (*CustomerSummary, error) {
+	return s.repository.GetLast12MonthsNewCustomers(accountID, endDate)
+}
+
+// GetCustomersForDate retrieves customer data for a specific date, grouped by hour
+func (s *DashboardService) GetCustomersForDate(accountID uuid.UUID, date time.Time) (*CustomerSummary, error) {
+	return s.repository.GetCustomersForDate(accountID, date)
+}
+
 // DashboardHandler handles HTTP requests for dashboard operations
 type DashboardHandler struct{}
 
@@ -683,21 +1150,42 @@ func (h *DashboardHandler) GetDailySales(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Check permissions
-	user, err := GetUserFromContext(r.Context())
-	if err != nil {
-		JsonResponse(w, http.StatusUnauthorized, "Not authenticated", nil)
-		return
-	}
-
-	if account.UserID != user.ID {
-		// Check if API key has access
+	// Check if request is using API key
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		// API key exists, check permissions
 		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		// Get account from API key and check if it matches the requested account
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		// No API key, check user permissions
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		// Check if user owns the account
+		if account.UserID != user.ID {
 			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
 			return
 		}
 	}
 
+	// Rest of handler code remains the same
 	summary, err := dashboardService.GetSalesForDate(accountID, date)
 	if err != nil {
 		logger.Error("Error getting sales for date", "error", err, "account_id", accountID, "date", dateStr)
@@ -731,16 +1219,36 @@ func (h *DashboardHandler) GetLast7DaysSales(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Check permissions
-	user, err := GetUserFromContext(r.Context())
-	if err != nil {
-		JsonResponse(w, http.StatusUnauthorized, "Not authenticated", nil)
-		return
-	}
-
-	if account.UserID != user.ID {
-		// Check if API key has access
+	// Check if request is using API key
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		// API key exists, check permissions
 		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		// Get account from API key and check if it matches the requested account
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		// No API key, check user permissions
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		// Check if user owns the account
+		if account.UserID != user.ID {
 			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
 			return
 		}
@@ -779,16 +1287,36 @@ func (h *DashboardHandler) GetLast30DaysSales(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Check permissions
-	user, err := GetUserFromContext(r.Context())
-	if err != nil {
-		JsonResponse(w, http.StatusUnauthorized, "Not authenticated", nil)
-		return
-	}
-
-	if account.UserID != user.ID {
-		// Check if API key has access
+	// Check if request is using API key
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		// API key exists, check permissions
 		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		// Get account from API key and check if it matches the requested account
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		// No API key, check user permissions
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		// Check if user owns the account
+		if account.UserID != user.ID {
 			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
 			return
 		}
@@ -827,16 +1355,36 @@ func (h *DashboardHandler) GetLast6MonthsSales(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Check permissions
-	user, err := GetUserFromContext(r.Context())
-	if err != nil {
-		JsonResponse(w, http.StatusUnauthorized, "Not authenticated", nil)
-		return
-	}
-
-	if account.UserID != user.ID {
-		// Check if API key has access
+	// Check if request is using API key
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		// API key exists, check permissions
 		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		// Get account from API key and check if it matches the requested account
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		// No API key, check user permissions
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		// Check if user owns the account
+		if account.UserID != user.ID {
 			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
 			return
 		}
@@ -875,16 +1423,36 @@ func (h *DashboardHandler) GetLast12MonthsSales(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Check permissions
-	user, err := GetUserFromContext(r.Context())
-	if err != nil {
-		JsonResponse(w, http.StatusUnauthorized, "Not authenticated", nil)
-		return
-	}
-
-	if account.UserID != user.ID {
-		// Check if API key has access
+	// Check if request is using API key
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		// API key exists, check permissions
 		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		// Get account from API key and check if it matches the requested account
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		// No API key, check user permissions
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		// Check if user owns the account
+		if account.UserID != user.ID {
 			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
 			return
 		}
@@ -898,6 +1466,316 @@ func (h *DashboardHandler) GetLast12MonthsSales(w http.ResponseWriter, r *http.R
 	}
 
 	JsonResponse(w, http.StatusOK, fmt.Sprintf("Last 12 months sales data ending on %s retrieved successfully", dateStr), summary)
+}
+
+// GetLast7DaysNewCustomers handles the request for the last 7 days' new customer data
+func (h *DashboardHandler) GetLast7DaysNewCustomers(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountID")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	dateStr := chi.URLParam(r, "date")
+	endDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
+			return
+		}
+	}
+
+	summary, err := dashboardService.GetLast7DaysNewCustomers(accountID, endDate)
+	if err != nil {
+		logger.Error("Error getting last 7 days new customers", "error", err, "account_id", accountID, "end_date", dateStr)
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving new customer data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, fmt.Sprintf("Last 7 days new customer data ending on %s retrieved successfully", dateStr), summary)
+}
+
+// GetLast30DaysNewCustomers handles the request for the last 30 days' new customer data
+func (h *DashboardHandler) GetLast30DaysNewCustomers(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountID")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	dateStr := chi.URLParam(r, "date")
+	endDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
+			return
+		}
+	}
+
+	summary, err := dashboardService.GetLast30DaysNewCustomers(accountID, endDate)
+	if err != nil {
+		logger.Error("Error getting last 30 days new customers", "error", err, "account_id", accountID, "end_date", dateStr)
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving new customer data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, fmt.Sprintf("Last 30 days new customer data ending on %s retrieved successfully", dateStr), summary)
+}
+
+// GetLast6MonthsNewCustomers handles the request for the last 6 months' new customer data
+func (h *DashboardHandler) GetLast6MonthsNewCustomers(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountID")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	dateStr := chi.URLParam(r, "date")
+	endDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
+			return
+		}
+	}
+
+	summary, err := dashboardService.GetLast6MonthsNewCustomers(accountID, endDate)
+	if err != nil {
+		logger.Error("Error getting last 6 months new customers", "error", err, "account_id", accountID, "end_date", dateStr)
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving new customer data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, fmt.Sprintf("Last 6 months new customer data ending on %s retrieved successfully", dateStr), summary)
+}
+
+// GetLast12MonthsNewCustomers handles the request for the last 12 months' new customer data
+func (h *DashboardHandler) GetLast12MonthsNewCustomers(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountID")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	dateStr := chi.URLParam(r, "date")
+	endDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
+			return
+		}
+	}
+
+	summary, err := dashboardService.GetLast12MonthsNewCustomers(accountID, endDate)
+	if err != nil {
+		logger.Error("Error getting last 12 months new customers", "error", err, "account_id", accountID, "end_date", dateStr)
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving new customer data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, fmt.Sprintf("Last 12 months new customer data ending on %s retrieved successfully", dateStr), summary)
+}
+
+// GetDailyCustomers handles the request for a specific date's new customer data
+func (h *DashboardHandler) GetDailyCustomers(w http.ResponseWriter, r *http.Request) {
+	accountIDStr := chi.URLParam(r, "accountID")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account ID", err.Error())
+		return
+	}
+
+	dateStr := chi.URLParam(r, "date")
+	date, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	_, apiKeyErr := GetAPIKeyFromContext(r.Context())
+	if apiKeyErr == nil {
+		if !CheckAPIPermission(r.Context(), "dashboard", "read") {
+			JsonResponse(w, http.StatusForbidden, "API key doesn't have permission to access dashboard", nil)
+			return
+		}
+
+		apiKeyAccount, err := GetAccountFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error retrieving account from API key", err.Error())
+			return
+		}
+
+		if apiKeyAccount.ID != accountID {
+			JsonResponse(w, http.StatusForbidden, "This account doesn't belong to the API key", nil)
+			return
+		}
+	} else {
+		user, err := GetUserFromContext(r.Context())
+		if err != nil {
+			JsonResponse(w, http.StatusUnauthorized, "Authentication required", nil)
+			return
+		}
+
+		if account.UserID != user.ID {
+			JsonResponse(w, http.StatusForbidden, "Not authorized to access this account's dashboard", nil)
+			return
+		}
+	}
+
+	summary, err := dashboardService.GetCustomersForDate(accountID, date)
+	if err != nil {
+		logger.Error("Error getting daily new customers", "error", err, "account_id", accountID, "date", dateStr)
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving new customer data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, fmt.Sprintf("New customer data for %s retrieved successfully", dateStr), summary)
 }
 
 // Setup global handler instance
