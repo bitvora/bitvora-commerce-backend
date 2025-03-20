@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"time"
@@ -67,6 +68,11 @@ const (
 	WebhookEventSubscriptionSuspended         = "subscription.suspended"
 	WebhookEventSubscriptionReactivated       = "subscription.reactivated"
 	WebhookEventSubscriptionCanceled          = "subscription.canceled"
+
+	// Add constants for retry timing logic
+	MinRetryWaitMinutes       = 5
+	MaxRetryWaitPercentage    = 0.25
+	DefaultRetryIntervalHours = 24
 )
 
 func isValidJSON(data json.RawMessage) bool {
@@ -425,6 +431,40 @@ func (s *SubscriptionService) ProcessRenewal(subscription *Subscription) {
 		subscription.LastPaymentDate = &now
 		subscription.FailedPaymentAttempts++
 
+		// Calculate next retry time based on billing interval
+		var retryWaitDuration time.Duration
+
+		if subscription.BillingIntervalHours != nil && *subscription.BillingIntervalHours > 0 {
+			// Calculate minutes to wait based on percentage of billing interval
+			billingIntervalMinutes := float64(*subscription.BillingIntervalHours) * 60
+
+			// Apply exponential backoff based on failed attempts (2^n - 1)
+			failureFactor := math.Pow(2, float64(subscription.FailedPaymentAttempts)) - 1
+
+			// Calculate adaptive retry time (in minutes)
+			retryWaitMinutes := math.Min(
+				billingIntervalMinutes*MaxRetryWaitPercentage*failureFactor,
+				billingIntervalMinutes*0.8, // Never wait more than 80% of billing interval
+			)
+
+			// Ensure minimum wait time
+			retryWaitMinutes = math.Max(retryWaitMinutes, float64(MinRetryWaitMinutes))
+
+			retryWaitDuration = time.Duration(retryWaitMinutes) * time.Minute
+
+			logger.Info("Calculated adaptive retry wait time",
+				"subscription_id", subscription.ID,
+				"billing_interval_hours", *subscription.BillingIntervalHours,
+				"failed_attempts", subscription.FailedPaymentAttempts,
+				"retry_wait_minutes", retryWaitMinutes)
+		} else {
+			// Fallback to default retry interval if billing interval is unknown
+			retryWaitDuration = time.Duration(DefaultRetryIntervalHours) * time.Hour
+		}
+
+		// Set the next billing date to now + retry wait time
+		subscription.NextBillingDate = now.Add(retryWaitDuration)
+
 		// Suspend subscription after too many failures
 		if subscription.FailedPaymentAttempts >= MaxPaymentRetryAttempts {
 			subscription.Status = SubscriptionStatusSuspended
@@ -448,22 +488,13 @@ func (s *SubscriptionService) ProcessRenewal(subscription *Subscription) {
 				subscription,
 			)
 		} else {
-			// Calculate next retry with exponential backoff
-			// Retry after 2^attempts hours (capped at 48 hours)
-			retryHours := 1 << subscription.FailedPaymentAttempts
-			if retryHours > 48 {
-				retryHours = 48
-			}
-
-			// Set next billing date to the retry time
-			subscription.NextBillingDate = now.Add(time.Duration(retryHours) * time.Hour)
-
-			// Send notification about failed payment with retry info
+			// Send notification about failed payment
 			notificationData := map[string]interface{}{
 				"subscription_id": subscription.ID.String(),
 				"customer_id":     subscription.CustomerID.String(),
 				"attempt":         subscription.FailedPaymentAttempts,
-				"retry_after":     subscription.NextBillingDate,
+				"max_attempts":    MaxPaymentRetryAttempts,
+				"next_retry_date": subscription.NextBillingDate,
 			}
 			notificationService.SendNotification(
 				NotificationEventSubscriptionPaymentFailed,
@@ -479,18 +510,13 @@ func (s *SubscriptionService) ProcessRenewal(subscription *Subscription) {
 			)
 		}
 	} else {
-		// Payment successful
-		logger.Info("Subscription payment successful",
-			"subscription_id", subscription.ID,
-			"customer_id", subscription.CustomerID)
-
-		// Update subscription with successful payment details
+		// Payment was successful
 		successStatus := PaymentStatusSuccess
 		subscription.LastPaymentStatus = &successStatus
 		subscription.LastPaymentDate = &now
 		subscription.FailedPaymentAttempts = 0
 
-		// If subscription was suspended, reactivate it
+		// If subscription was suspended and payment succeeded, reactivate it
 		if subscription.Status == SubscriptionStatusSuspended {
 			subscription.Status = SubscriptionStatusActive
 
@@ -513,20 +539,13 @@ func (s *SubscriptionService) ProcessRenewal(subscription *Subscription) {
 			)
 		}
 
-		// Calculate next billing date
+		// Calculate next billing date based on billing interval
 		if subscription.BillingIntervalHours != nil {
-			subscription.NextBillingDate = now.Add(time.Duration(*subscription.BillingIntervalHours) * time.Hour)
+			subscription.NextBillingDate = now.Add(
+				time.Duration(*subscription.BillingIntervalHours) * time.Hour)
 		} else {
-			// Try to get interval from product
-			product, err := productService.Get(subscription.ProductID)
-			if err == nil && product.BillingPeriodHours != nil {
-				// Store for future reference
-				subscription.BillingIntervalHours = product.BillingPeriodHours
-				subscription.NextBillingDate = now.Add(time.Duration(*product.BillingPeriodHours) * time.Hour)
-			} else {
-				// Default to monthly if we can't get product info
-				subscription.NextBillingDate = now.AddDate(0, 1, 0)
-			}
+			// Default to 30 days if no interval is available
+			subscription.NextBillingDate = now.AddDate(0, 1, 0)
 		}
 
 		// Send notification about successful payment
