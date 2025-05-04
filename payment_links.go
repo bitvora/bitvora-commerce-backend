@@ -20,6 +20,7 @@ type PaymentLink struct {
 	Currency      string           `db:"currency" json:"currency"`
 	Metadata      *json.RawMessage `db:"metadata" json:"metadata,omitempty"`
 	Items         *json.RawMessage `db:"items" json:"items,omitempty"`
+	RedirectLink  *string          `db:"redirect_link" json:"redirect_link,omitempty"`
 	ExpiryMinutes int              `db:"expiry_minutes" json:"expiry_minutes"`
 	CreatedAt     time.Time        `db:"created_at" json:"created_at"`
 	UpdatedAt     time.Time        `db:"updated_at" json:"updated_at"`
@@ -55,15 +56,15 @@ func (r *PaymentLinkRepository) Create(paymentLink *PaymentLink) (*PaymentLink, 
 	err := db.Get(paymentLink, `
 		INSERT INTO payment_links (
 			id, user_id, account_id, product_id, amount, currency,
-			metadata, items, expiry_minutes, created_at, updated_at, deleted_at
+			metadata, items, redirect_link, expiry_minutes, created_at, updated_at, deleted_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6,
-			$7, $8, $9, $10, $11, $12
+			$7, $8, $9, $10, $11, $12, $13
 		) RETURNING *`,
 		paymentLink.ID, paymentLink.UserID, paymentLink.AccountID, paymentLink.ProductID,
 		paymentLink.Amount, paymentLink.Currency,
-		paymentLink.Metadata, paymentLink.Items, paymentLink.ExpiryMinutes,
-		paymentLink.CreatedAt, paymentLink.UpdatedAt, paymentLink.DeletedAt)
+		paymentLink.Metadata, paymentLink.Items, paymentLink.RedirectLink,
+		paymentLink.ExpiryMinutes, paymentLink.CreatedAt, paymentLink.UpdatedAt, paymentLink.DeletedAt)
 	return paymentLink, err
 }
 
@@ -89,11 +90,11 @@ func (r *PaymentLinkRepository) Update(paymentLink *PaymentLink) error {
 	_, err := db.Exec(`
 		UPDATE payment_links SET 
 			product_id=$1, amount=$2, currency=$3, metadata=$4, items=$5, 
-			expiry_minutes=$6, updated_at=$7
-		WHERE id=$8`,
+			redirect_link=$6, expiry_minutes=$7, updated_at=$8
+		WHERE id=$9`,
 		paymentLink.ProductID, paymentLink.Amount, paymentLink.Currency,
 		paymentLink.Metadata, paymentLink.Items,
-		paymentLink.ExpiryMinutes, paymentLink.UpdatedAt, paymentLink.ID)
+		paymentLink.RedirectLink, paymentLink.ExpiryMinutes, paymentLink.UpdatedAt, paymentLink.ID)
 	return err
 }
 
@@ -190,15 +191,16 @@ func (s *PaymentLinkService) CreateCheckoutFromLink(paymentLinkID uuid.UUID) (*C
 	}
 
 	checkout := &Checkout{
-		ID:        uuid.New(),
-		UserID:    paymentLink.UserID,
-		AccountID: paymentLink.AccountID,
-		ProductID: paymentLink.ProductID,
-		Amount:    amountInSats, // Use converted amount
-		Metadata:  paymentLink.Metadata,
-		Items:     paymentLink.Items,
-		Rates:     ratesJSON,
-		ExpiresAt: time.Now().Add(time.Duration(paymentLink.ExpiryMinutes) * time.Minute),
+		ID:          uuid.New(),
+		UserID:      paymentLink.UserID,
+		AccountID:   paymentLink.AccountID,
+		ProductID:   paymentLink.ProductID,
+		Amount:      amountInSats, // Use converted amount
+		Metadata:    paymentLink.Metadata,
+		Items:       paymentLink.Items,
+		RedirectURL: paymentLink.RedirectLink, // Use the payment link's redirect_link
+		Rates:       ratesJSON,
+		ExpiresAt:   time.Now().Add(time.Duration(paymentLink.ExpiryMinutes) * time.Minute),
 	}
 
 	return checkoutService.Create(checkout)
@@ -220,6 +222,7 @@ func (h *PaymentLinkHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Currency      string           `json:"currency" validate:"required_without=ProductID"`
 		Metadata      *json.RawMessage `json:"metadata"`
 		Items         *json.RawMessage `json:"items"`
+		RedirectLink  *string          `json:"redirect_link"`
 		ExpiryMinutes int              `json:"expiry_minutes"`
 	}
 
@@ -306,6 +309,7 @@ func (h *PaymentLinkHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Currency:      currency,
 		Metadata:      input.Metadata,
 		Items:         input.Items,
+		RedirectLink:  input.RedirectLink,
 		ExpiryMinutes: input.ExpiryMinutes,
 	}
 
@@ -379,6 +383,7 @@ func (h *PaymentLinkHandler) Update(w http.ResponseWriter, r *http.Request) {
 		Currency      string           `json:"currency" validate:"required_without=ProductID"`
 		Metadata      *json.RawMessage `json:"metadata"`
 		Items         *json.RawMessage `json:"items"`
+		RedirectLink  *string          `json:"redirect_link"`
 		ExpiryMinutes int              `json:"expiry_minutes"`
 	}
 
@@ -461,6 +466,7 @@ func (h *PaymentLinkHandler) Update(w http.ResponseWriter, r *http.Request) {
 	paymentLink.Currency = currency
 	paymentLink.Metadata = input.Metadata
 	paymentLink.Items = input.Items
+	paymentLink.RedirectLink = input.RedirectLink
 	if input.ExpiryMinutes > 0 {
 		paymentLink.ExpiryMinutes = input.ExpiryMinutes
 	}
