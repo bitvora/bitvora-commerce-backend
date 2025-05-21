@@ -1503,3 +1503,7 @@ func (l *WalletListener) AddWallet(wallet *WalletConnection) {
 
 	l.EnsureRelaySubscription(wallet.NostrRelay)
 }
+
+func (s *WalletService) ParseWalletConnectString(walletConnect string) (*WalletConnection, error) {
+	return parseWalletConnectString(walletConnect)
+}
