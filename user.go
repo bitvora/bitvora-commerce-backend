@@ -1,11 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
-
-	"net/http"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
@@ -96,6 +103,121 @@ func (s *UserService) Create(user *User) (*User, error) {
 	return createdUser, err
 }
 
+func (s *UserService) CreateWalletForUser(user *User, password string) error {
+	// Check if NEW_WALLET_ENDPOINT is set
+	endpoint := os.Getenv("NEW_WALLET_ENDPOINT")
+	if endpoint == "" {
+		// Skip wallet creation if endpoint is not set
+		return nil
+	}
+
+	// Get shared secret from environment variable
+	secret := os.Getenv("NEW_WALLET_API_SECRET")
+	if secret == "" {
+		return fmt.Errorf("NEW_WALLET_API_SECRET is not set")
+	}
+
+	// Generate timestamp
+	timestamp := time.Now().Unix()
+
+	// Calculate signature
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write([]byte(user.Email + strconv.FormatInt(timestamp, 10)))
+	signature := hex.EncodeToString(h.Sum(nil))
+
+	// Create request body
+	requestBody, err := json.Marshal(map[string]interface{}{
+		"email":         user.Email,
+		"password":      password,
+		"signature":     signature,
+		"business_name": user.Email, // Using email as business name as a fallback
+		"timestamp":     timestamp,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	// Make the POST request
+	resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(requestBody))
+	if err != nil {
+		return fmt.Errorf("failed to make wallet creation request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Check if the request was successful
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("wallet creation failed with status code %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Parse the response
+	var response struct {
+		Status  int    `json:"status"`
+		Message string `json:"message"`
+		Data    struct {
+			SessionID       string `json:"session_id"`
+			CompanyID       string `json:"company_id"`
+			Email           string `json:"email"`
+			NwcString       string `json:"nwc_string"`
+			NwcConnectionID string `json:"nwc_connection_id"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(respBody, &response); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	// Check if nwc_string is present
+	if response.Data.NwcString == "" {
+		return fmt.Errorf("empty NWC string received")
+	}
+
+	// Parse the wallet connect string
+	parsedWallet, err := walletService.ParseWalletConnectString(response.Data.NwcString)
+	if err != nil {
+		return fmt.Errorf("failed to parse wallet connect string: %w", err)
+	}
+
+	// Create a default account for the user
+	account := &Account{
+		ID:        uuid.New(),
+		UserID:    user.ID,
+		Name:      "Default Account",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+
+	createdAccount, err := accountRepository.Create(account)
+	if err != nil {
+		return fmt.Errorf("failed to create default account: %w", err)
+	}
+
+	// Create the wallet connection
+	wallet := &WalletConnection{
+		ID:          uuid.New(),
+		UserID:      user.ID,
+		AccountID:   createdAccount.ID,
+		NostrPubkey: parsedWallet.NostrPubkey,
+		NostrSecret: parsedWallet.NostrSecret,
+		NostrRelay:  parsedWallet.NostrRelay,
+		Active:      true,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+
+	_, err = walletService.Create(wallet)
+	if err != nil {
+		return fmt.Errorf("failed to create wallet connection: %w", err)
+	}
+
+	return nil
+}
+
 func (s *UserService) Update(user *User) error {
 	if user.Password != "" {
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
@@ -168,6 +290,14 @@ func (h *UserHandler) Register(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// After successfully creating the user, attempt to create a wallet
+	err = userService.CreateWalletForUser(createdUser, input.Password)
+	if err != nil {
+		// Log the error but don't fail the registration if wallet creation fails
+		// This way users can still register even if wallet creation has issues
+		logger.Error("Failed to create wallet for new user", "error", err.Error(), "user_id", createdUser.ID)
 	}
 
 	JsonResponse(w, http.StatusCreated, "User created successfully", createdUser)
