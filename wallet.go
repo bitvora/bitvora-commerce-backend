@@ -787,6 +787,61 @@ func (h *WalletHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	JsonResponse(w, http.StatusOK, "Wallet connection deleted successfully", nil)
 }
 
+func (h *WalletHandler) GetBalance(w http.ResponseWriter, r *http.Request) {
+	user, err := GetUserFromContext(r.Context())
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
+		return
+	}
+
+	accountIDStr := r.URL.Query().Get("account_id")
+	if accountIDStr == "" {
+		JsonResponse(w, http.StatusBadRequest, "Missing account_id parameter", nil)
+		return
+	}
+
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account_id parameter", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	if account.UserID != user.ID {
+		JsonResponse(w, http.StatusForbidden, "You are not authorized to view balance for this account", nil)
+		return
+	}
+
+	wallet, err := walletService.GetActiveWalletByAccount(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving active wallet", err.Error())
+		return
+	}
+
+	balanceMsats, err := walletService.GetBalance(wallet.ID)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error getting wallet balance", err.Error())
+		return
+	}
+
+	// Convert millisatoshis to satoshis
+	balanceSats := balanceMsats / 1000
+
+	response := map[string]interface{}{
+		"balance_msats": balanceMsats,
+		"balance_sats":  balanceSats,
+		"wallet_id":     wallet.ID,
+		"account_id":    accountID,
+	}
+
+	JsonResponse(w, http.StatusOK, "Wallet balance retrieved successfully", response)
+}
+
 func (h *WalletHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		AccountID uuid.UUID `json:"account_id" validate:"required"`
@@ -824,6 +879,26 @@ func (h *WalletHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
 	wallet, err := walletService.GetActiveWalletByAccount(input.AccountID)
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Error retrieving active wallet", err.Error())
+		return
+	}
+
+	// Check wallet balance before attempting payment
+	balanceMsats, err := walletService.GetBalance(wallet.ID)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error checking wallet balance", err.Error())
+		return
+	}
+
+	// Convert input amount (sats) to millisatoshis for comparison
+	requiredMsats := input.Amount * 1000
+
+	if balanceMsats < requiredMsats {
+		response := map[string]interface{}{
+			"available_balance_sats": balanceMsats / 1000,
+			"required_amount_sats":   input.Amount,
+			"shortage_sats":          (requiredMsats - balanceMsats) / 1000,
+		}
+		JsonResponse(w, http.StatusBadRequest, "Insufficient wallet balance", response)
 		return
 	}
 
@@ -1617,6 +1692,78 @@ func (s *WalletService) ListTransactions(walletID uuid.UUID, from, until int64, 
 	}
 
 	return nil, fmt.Errorf("wallet listener not initialized, cannot wait for response")
+}
+
+func (s *WalletService) GetBalance(walletID uuid.UUID) (int64, error) {
+	wallet, err := s.Get(walletID)
+	if err != nil {
+		return 0, err
+	}
+
+	request := struct {
+		Method string   `json:"method"`
+		Params struct{} `json:"params"`
+	}{
+		Method: "get_balance",
+		Params: struct{}{},
+	}
+
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
+	if err != nil {
+		return 0, fmt.Errorf("failed to compute shared secret: %w", err)
+	}
+
+	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
+	if err != nil {
+		return 0, fmt.Errorf("failed to encrypt content: %w", err)
+	}
+
+	event := nostr.Event{
+		Kind:      nostr.KindNWCWalletRequest,
+		PubKey:    wallet.NostrPubkey,
+		CreatedAt: nostr.Now(),
+		Content:   encryptedContent,
+		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
+	}
+
+	event.Sign(wallet.NostrSecret)
+
+	if walletListener == nil {
+		return 0, fmt.Errorf("wallet listener not initialized, cannot wait for response")
+	}
+
+	walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
+
+	responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second, nil)
+	if err != nil {
+		return 0, fmt.Errorf("error waiting for balance: %w", err)
+	}
+
+	var response struct {
+		ResultType string `json:"result_type"`
+		Result     struct {
+			Balance int64 `json:"balance"`
+		} `json:"result"`
+		Error *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+
+	if err := json.Unmarshal(responseData, &response); err != nil {
+		return 0, fmt.Errorf("failed to parse balance response: %w", err)
+	}
+
+	if response.Error != nil {
+		return 0, fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
+	}
+
+	return response.Result.Balance, nil
 }
 
 func (s *WalletService) GetInfo(nostrPubkey, secret, relay string) ([]byte, error) {
