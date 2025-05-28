@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -840,6 +841,101 @@ func (h *WalletHandler) GetBalance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	JsonResponse(w, http.StatusOK, "Wallet balance retrieved successfully", response)
+}
+
+func (h *WalletHandler) GetTransactions(w http.ResponseWriter, r *http.Request) {
+	user, err := GetUserFromContext(r.Context())
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
+		return
+	}
+
+	accountIDStr := r.URL.Query().Get("account_id")
+	if accountIDStr == "" {
+		JsonResponse(w, http.StatusBadRequest, "Missing account_id parameter", nil)
+		return
+	}
+
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid account_id parameter", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	if account.UserID != user.ID {
+		JsonResponse(w, http.StatusForbidden, "You are not authorized to view transactions for this account", nil)
+		return
+	}
+
+	wallet, err := walletService.GetActiveWalletByAccount(accountID)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving active wallet", err.Error())
+		return
+	}
+
+	// Parse query parameters for filtering transactions
+	var from, until int64
+	var limit, offset int
+	var unpaid bool
+	var txType string
+
+	// Parse 'from' parameter (timestamp)
+	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
+		if fromVal, err := strconv.ParseInt(fromStr, 10, 64); err == nil {
+			from = fromVal
+		}
+	}
+
+	// Parse 'until' parameter (timestamp)
+	if untilStr := r.URL.Query().Get("until"); untilStr != "" {
+		if untilVal, err := strconv.ParseInt(untilStr, 10, 64); err == nil {
+			until = untilVal
+		}
+	}
+
+	// Parse 'limit' parameter
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if limitVal, err := strconv.Atoi(limitStr); err == nil && limitVal > 0 {
+			limit = limitVal
+		}
+	}
+
+	// Parse 'offset' parameter
+	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
+		if offsetVal, err := strconv.Atoi(offsetStr); err == nil && offsetVal >= 0 {
+			offset = offsetVal
+		}
+	}
+
+	// Parse 'unpaid' parameter
+	if unpaidStr := r.URL.Query().Get("unpaid"); unpaidStr != "" {
+		unpaid, _ = strconv.ParseBool(unpaidStr)
+	}
+
+	// Parse 'type' parameter
+	txType = r.URL.Query().Get("type")
+
+	// Call the wallet service to get transactions
+	transactionsData, err := walletService.ListTransactions(wallet.ID, from, until, limit, offset, unpaid, txType)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving wallet transactions", err.Error())
+		return
+	}
+
+	// Parse the response to return as JSON
+	var result interface{}
+	if err := json.Unmarshal(transactionsData, &result); err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error parsing transaction data", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, "Wallet transactions retrieved successfully", result)
 }
 
 func (h *WalletHandler) Withdraw(w http.ResponseWriter, r *http.Request) {

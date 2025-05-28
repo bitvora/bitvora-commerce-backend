@@ -115,6 +115,7 @@ func InitRoutes() http.Handler {
 		r.Delete("/wallet/{id}", walletHandler.Delete)
 
 		r.Get("/wallet/balance", walletHandler.GetBalance)
+		r.Get("/wallet/transactions", walletHandler.GetTransactions)
 		r.Post("/wallet/withdraw", walletHandler.Withdraw)
 		r.Post("/invoice", walletHandler.MakeInvoice)
 		r.Post("/checkout", checkoutHandler.Create)
