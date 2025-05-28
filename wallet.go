@@ -280,6 +280,8 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 
 	if paymentResponse.Error != nil {
 		logger.Warn("Payment error received", "event_id", event.ID, "error", paymentResponse.Error)
+		// Send the error response to the waiting promise so it doesn't timeout
+		promise.Response <- []byte(decryptedContent)
 		return
 	}
 
@@ -785,6 +787,125 @@ func (h *WalletHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	JsonResponse(w, http.StatusOK, "Wallet connection deleted successfully", nil)
 }
 
+func (h *WalletHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		AccountID uuid.UUID `json:"account_id" validate:"required"`
+		Recipient string    `json:"recipient" validate:"required"`
+		Amount    int64     `json:"amount" validate:"required,min=1"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	if err := h.Validator.Struct(input); err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	user, err := GetUserFromContext(r.Context())
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving user", err.Error())
+		return
+	}
+
+	account, err := accountService.Get(input.AccountID)
+	if err != nil {
+		JsonResponse(w, http.StatusNotFound, "Account not found", err.Error())
+		return
+	}
+
+	if account.UserID != user.ID {
+		JsonResponse(w, http.StatusForbidden, "You are not authorized to withdraw from this account", nil)
+		return
+	}
+
+	wallet, err := walletService.GetActiveWalletByAccount(input.AccountID)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Error retrieving active wallet", err.Error())
+		return
+	}
+
+	// Determine recipient type by parsing the string
+	recipientType := determineRecipientType(input.Recipient)
+
+	switch recipientType {
+	case "lightning_invoice":
+		// Pay lightning invoice using NWC
+		response, err := walletService.PayInvoiceWithResponse(wallet.ID, input.Recipient)
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error paying lightning invoice", err.Error())
+			return
+		}
+
+		JsonResponse(w, http.StatusCreated, "Payment sent successfully", response)
+
+	case "lightning_address":
+		// TODO: Implement lightning address payment
+		// 1. Resolve lightning address to get LNURL-pay endpoint
+		// 2. Fetch payment request from LNURL-pay endpoint with amount
+		// 3. Pay the returned invoice
+		JsonResponse(w, http.StatusNotImplemented, "Lightning address payments not yet implemented", nil)
+
+	case "bitcoin_address":
+		// TODO: Implement on-chain bitcoin payment
+		// 1. Validate bitcoin address format
+		// 2. Create on-chain transaction using wallet's make_chain_transaction method
+		// 3. Broadcast transaction
+		JsonResponse(w, http.StatusNotImplemented, "Bitcoin address payments not yet implemented", nil)
+
+	default:
+		JsonResponse(w, http.StatusBadRequest, "Invalid recipient format", "Recipient must be a lightning invoice, lightning address, or bitcoin address")
+	}
+}
+
+// determineRecipientType analyzes the recipient string to determine its type
+func determineRecipientType(recipient string) string {
+	recipient = strings.TrimSpace(strings.ToLower(recipient))
+
+	// Lightning invoice: starts with lnbc (mainnet) or lntb (testnet)
+	if strings.HasPrefix(recipient, "lnbc") || strings.HasPrefix(recipient, "lntb") {
+		return "lightning_invoice"
+	}
+
+	// Lightning address: email-like format (handle@domain.tld)
+	if strings.Contains(recipient, "@") && strings.Contains(recipient, ".") {
+		// Basic validation for email-like format
+		parts := strings.Split(recipient, "@")
+		if len(parts) == 2 && len(parts[0]) > 0 && len(parts[1]) > 0 {
+			return "lightning_address"
+		}
+	}
+
+	// Bitcoin addresses can be:
+	// - Legacy (P2PKH): starts with 1, length 26-35
+	// - Script (P2SH): starts with 3, length 26-35
+	// - Bech32 (native segwit): starts with bc1, length 42 for P2WPKH or 62 for P2WSH
+	// - Taproot: starts with bc1p, length 62
+
+	originalRecipient := strings.TrimSpace(recipient) // Keep original case for address validation
+
+	// Legacy address (P2PKH)
+	if strings.HasPrefix(originalRecipient, "1") && len(originalRecipient) >= 26 && len(originalRecipient) <= 35 {
+		return "bitcoin_address"
+	}
+
+	// Script address (P2SH)
+	if strings.HasPrefix(originalRecipient, "3") && len(originalRecipient) >= 26 && len(originalRecipient) <= 35 {
+		return "bitcoin_address"
+	}
+
+	// Bech32 segwit address
+	if strings.HasPrefix(originalRecipient, "bc1") {
+		if len(originalRecipient) == 42 || len(originalRecipient) == 62 {
+			return "bitcoin_address"
+		}
+	}
+
+	return "unknown"
+}
+
 func (l *WalletListener) Start() error {
 	err := l.loadWalletConnectionsToMemory()
 	if err != nil {
@@ -1067,6 +1188,95 @@ func (s *WalletService) PayInvoice(walletID uuid.UUID, invoice string) error {
 		pool.PublishMany(ctx, []string{wallet.NostrRelay}, event)
 		return fmt.Errorf("wallet listener not initialized, cannot wait for response")
 	}
+}
+
+// PayInvoiceWithResponse pays a lightning invoice and returns the full response data including preimage
+func (s *WalletService) PayInvoiceWithResponse(walletID uuid.UUID, invoice string) (map[string]interface{}, error) {
+	wallet, err := s.Get(walletID)
+	if err != nil {
+		return nil, err
+	}
+
+	logger.Info("Paying invoice", "wallet_id", walletID, "invoice", invoice)
+
+	request := struct {
+		Method string `json:"method"`
+		Params struct {
+			Invoice string `json:"invoice"`
+		} `json:"params"`
+	}{
+		Method: "pay_invoice",
+		Params: struct {
+			Invoice string `json:"invoice"`
+		}{
+			Invoice: invoice,
+		},
+	}
+
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute shared secret: %w", err)
+	}
+
+	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt content: %w", err)
+	}
+
+	event := nostr.Event{
+		Kind:      nostr.KindNWCWalletRequest,
+		PubKey:    wallet.NostrPubkey,
+		CreatedAt: nostr.Now(),
+		Content:   encryptedContent,
+		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
+	}
+
+	event.Sign(wallet.NostrSecret)
+
+	if walletListener == nil {
+		return nil, fmt.Errorf("wallet listener not initialized, cannot wait for response")
+	}
+
+	walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
+
+	responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error waiting for payment response: %w", err)
+	}
+
+	var response struct {
+		Result struct {
+			Preimage string `json:"preimage"`
+			FeesPaid int64  `json:"fees_paid"`
+		} `json:"result"`
+		Error *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+
+	if err := json.Unmarshal(responseData, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse payment response: %w", err)
+	}
+
+	if response.Error != nil {
+		return nil, fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
+	}
+
+	// Return the full response data
+	result := map[string]interface{}{
+		"preimage":  response.Result.Preimage,
+		"fees_paid": response.Result.FeesPaid,
+		"invoice":   invoice,
+		"wallet_id": walletID,
+	}
+
+	return result, nil
 }
 
 func (s *WalletService) PayInvoiceWithConnection(pubkey, secret, relay, invoice string) error {
