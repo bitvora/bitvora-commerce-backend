@@ -917,11 +917,14 @@ func (h *WalletHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
 		JsonResponse(w, http.StatusCreated, "Payment sent successfully", response)
 
 	case "lightning_address":
-		// TODO: Implement lightning address payment
-		// 1. Resolve lightning address to get LNURL-pay endpoint
-		// 2. Fetch payment request from LNURL-pay endpoint with amount
-		// 3. Pay the returned invoice
-		JsonResponse(w, http.StatusNotImplemented, "Lightning address payments not yet implemented", nil)
+		// Pay lightning address using existing wallet functionality
+		response, err := walletService.PayLightningAddress(wallet.ID, input.Recipient, input.Amount)
+		if err != nil {
+			JsonResponse(w, http.StatusInternalServerError, "Error paying lightning address", err.Error())
+			return
+		}
+
+		JsonResponse(w, http.StatusCreated, "Payment sent successfully", response)
 
 	case "bitcoin_address":
 		// TODO: Implement on-chain bitcoin payment
@@ -1863,4 +1866,144 @@ func (l *WalletListener) AddWallet(wallet *WalletConnection) {
 
 func (s *WalletService) ParseWalletConnectString(walletConnect string) (*WalletConnection, error) {
 	return parseWalletConnectString(walletConnect)
+}
+
+type LnurlAddrResponse struct {
+	Status         string `json:"status"`
+	Tag            string `json:"tag"`
+	CommentAllowed int    `json:"commentAllowed"`
+	Callback       string `json:"callback"`
+	Metadata       string `json:"metadata"`
+	MinSendable    int    `json:"minSendable"`
+	MaxSendable    int    `json:"maxSendable"`
+	PayerData      struct {
+		Name struct {
+			Mandatory bool `json:"mandatory"`
+		} `json:"name"`
+		Email struct {
+			Mandatory bool `json:"mandatory"`
+		} `json:"email"`
+		Pubkey struct {
+			Mandatory bool `json:"mandatory"`
+		} `json:"pubkey"`
+	} `json:"payerData"`
+	NostrPubkey string `json:"nostrPubkey"`
+	AllowsNostr bool   `json:"allowsNostr"`
+}
+
+type LnurlCallbackResponse struct {
+	Status        string `json:"status"`
+	SuccessAction struct {
+		Tag     string `json:"tag"`
+		Message string `json:"message"`
+	} `json:"successAction"`
+	Verify string        `json:"verify"`
+	Routes []interface{} `json:"routes"`
+	PR     string        `json:"pr"`
+}
+
+// Helper functions for lightning address processing
+func isValidEmail(email string) bool {
+	parts := strings.Split(email, "@")
+	return len(parts) == 2 && len(parts[0]) > 0 && len(parts[1]) > 0 && strings.Contains(parts[1], ".")
+}
+
+func splitEmail(email string) (string, string) {
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		return "", ""
+	}
+	return parts[0], parts[1]
+}
+
+func (s *WalletService) GetLnAddrCallbackUrl(address string) (string, error) {
+	if !isValidEmail(address) {
+		return "", fmt.Errorf("invalid lightning address")
+	}
+
+	handle, domain := splitEmail(address)
+	endpoint := fmt.Sprintf("https://%s/.well-known/lnurlp/%s", domain, handle)
+
+	resp, err := http.Get(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("failed to make API call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API call failed with status code: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read API response: %w", err)
+	}
+
+	var lnAddrResponse LnurlAddrResponse
+	if err := json.Unmarshal(body, &lnAddrResponse); err != nil {
+		return "", fmt.Errorf("failed to parse API response: %w", err)
+	}
+
+	return lnAddrResponse.Callback, nil
+}
+
+func (s *WalletService) GetPRFromLnurl(endpoint string, mSatsAmount int64) (string, error) {
+	separator := "?"
+	if strings.Contains(endpoint, "?") {
+		separator = "&"
+	}
+
+	url := fmt.Sprintf("%s%samount=%d", endpoint, separator, mSatsAmount)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("failed to make API call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API call failed with status code: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read API response: %w", err)
+	}
+
+	var callbackResponse LnurlCallbackResponse
+	if err := json.Unmarshal(body, &callbackResponse); err != nil {
+		return "", fmt.Errorf("failed to parse API response: %w", err)
+	}
+
+	return callbackResponse.PR, nil
+}
+
+func (s *WalletService) PayLightningAddress(walletID uuid.UUID, lightningAddress string, amountSats int64) (map[string]interface{}, error) {
+	// Convert satoshis to millisatoshis
+	amountMsats := amountSats * 1000
+
+	// Step 1: Get the callback URL from the lightning address
+	callbackUrl, err := s.GetLnAddrCallbackUrl(lightningAddress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get callback URL for lightning address: %w", err)
+	}
+
+	// Step 2: Get the payment request (invoice) from the callback URL
+	invoice, err := s.GetPRFromLnurl(callbackUrl, amountMsats)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get invoice from LNURL callback: %w", err)
+	}
+
+	// Step 3: Pay the invoice using existing wallet functionality
+	response, err := s.PayInvoiceWithResponse(walletID, invoice)
+	if err != nil {
+		return nil, fmt.Errorf("failed to pay lightning address invoice: %w", err)
+	}
+
+	// Add lightning address info to response
+	response["lightning_address"] = lightningAddress
+	response["original_amount_sats"] = amountSats
+
+	return response, nil
 }
