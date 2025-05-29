@@ -18,8 +18,14 @@ func InitDB() {
 	dbName := os.Getenv("POSTGRES_DB")
 	dbPort := os.Getenv("POSTGRES_PORT")
 	dbHost := os.Getenv("POSTGRES_HOST")
+	dbSSLMode := os.Getenv("POSTGRES_SSLMODE")
 
-	connStr := "host=" + dbHost + " port=" + dbPort + " user=" + dbUser + " password=" + dbPassword + " dbname=" + dbName + " sslmode=disable"
+	// Default to require SSL if not specified
+	if dbSSLMode == "" {
+		dbSSLMode = "require"
+	}
+
+	connStr := "host=" + dbHost + " port=" + dbPort + " user=" + dbUser + " password=" + dbPassword + " dbname=" + dbName + " sslmode=" + dbSSLMode
 
 	db, err = sqlx.Connect("postgres", connStr)
 	if err != nil {
