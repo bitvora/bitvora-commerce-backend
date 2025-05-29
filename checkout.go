@@ -741,6 +741,8 @@ func (h *CheckoutHandler) ConnectWallet(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	logger.Info("Wallet info for subscriptions", "info", info)
+
 	var infoResponse struct {
 		ResultType string `json:"result_type"`
 		Result     struct {
@@ -784,13 +786,17 @@ func (h *CheckoutHandler) ConnectWallet(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Create invoice for the initial payment
+	logger.Info("Creating invoice for initial payment", "checkout_id", checkout.ID)
 	expirySeconds := int64(30 * 60)
 	description := fmt.Sprintf("Subscription checkout #%s", checkout.ID.String())
-	invoice, err := walletService.MakeInvoice(sellerWallet.ID, checkout.Amount, description, expirySeconds)
+	amountMsats := checkout.Amount * 1000
+	invoice, err := walletService.MakeInvoice(sellerWallet.ID, amountMsats, description, expirySeconds)
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Failed to create invoice", err.Error())
 		return
 	}
+
+	logger.Info("Invoice created", "invoice", invoice)
 
 	// Update checkout with the invoice
 	checkout.LightningInvoice = &invoice
@@ -801,12 +807,16 @@ func (h *CheckoutHandler) ConnectWallet(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	logger.Info("Paying invoice from customer's wallet", "invoice", invoice)
+
 	// Try to pay the invoice from customer's wallet
 	err = walletService.PayInvoiceWithConnection(parsedWallet.NostrPubkey, parsedWallet.NostrSecret, parsedWallet.NostrRelay, invoice)
 	if err != nil {
 		JsonResponse(w, http.StatusInternalServerError, "Failed to pay invoice", err.Error())
 		return
 	}
+
+	logger.Info("Invoice paid", "invoice", invoice)
 
 	// Start polling for payment confirmation
 	go func() {
@@ -846,7 +856,7 @@ func (h *CheckoutHandler) ConnectWallet(w http.ResponseWriter, r *http.Request) 
 					if tx.Invoice == *updatedCheckout.LightningInvoice && tx.SettledAt != nil && tx.Preimage != "" {
 						// Invoice has been paid, update the checkout state
 						newState := CheckoutStatePaid
-						receivedAmount := tx.Amount
+						receivedAmount := tx.Amount / 1000
 
 						if receivedAmount < updatedCheckout.Amount {
 							newState = CheckoutStateUnderpaid
