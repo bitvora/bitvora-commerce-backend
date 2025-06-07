@@ -20,14 +20,16 @@ import (
 )
 
 type User struct {
-	ID          uuid.UUID  `db:"id" json:"id"`
-	Email       string     `db:"email" json:"email"`
-	Password    string     `db:"password" json:"password"`
-	TOTPSecret  *string    `db:"totp_secret" json:"totp_secret,omitempty"`
-	LastLoginAt *time.Time `db:"last_login_at" json:"last_login_at,omitempty"`
-	CreatedAt   time.Time  `db:"created_at" json:"created_at"`
-	UpdatedAt   time.Time  `db:"updated_at" json:"updated_at"`
-	DeletedAt   *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+	ID                     uuid.UUID  `db:"id" json:"id"`
+	Email                  string     `db:"email" json:"email"`
+	Password               string     `db:"password" json:"password"`
+	TOTPSecret             *string    `db:"totp_secret" json:"totp_secret,omitempty"`
+	EmailConfirmationToken *string    `db:"email_confirmation_token" json:"email_confirmation_token,omitempty"`
+	EmailConfirmedAt       *time.Time `db:"email_confirmed_at" json:"email_confirmed_at,omitempty"`
+	LastLoginAt            *time.Time `db:"last_login_at" json:"last_login_at,omitempty"`
+	CreatedAt              time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt              time.Time  `db:"updated_at" json:"updated_at"`
+	DeletedAt              *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
 }
 
 type UserCache struct {
@@ -63,12 +65,12 @@ var userHandler = &UserHandler{
 }
 
 func (r *UserRepository) Create(user *User) (*User, error) {
-	err := db.Get(user, "INSERT INTO users (id, email, password, totp_secret, last_login_at, created_at, updated_at, deleted_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *", user.ID, user.Email, user.Password, user.TOTPSecret, user.LastLoginAt, user.CreatedAt, user.UpdatedAt, user.DeletedAt)
+	err := db.Get(user, "INSERT INTO users (id, email, password, totp_secret, email_confirmation_token, email_confirmed_at, last_login_at, created_at, updated_at, deleted_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *", user.ID, user.Email, user.Password, user.TOTPSecret, user.EmailConfirmationToken, user.EmailConfirmedAt, user.LastLoginAt, user.CreatedAt, user.UpdatedAt, user.DeletedAt)
 	return user, err
 }
 
 func (r *UserRepository) Update(user *User) error {
-	_, err := db.Exec("UPDATE users SET email=$1, password=$2, totp_secret=$3, last_login_at=$4, updated_at=$5, deleted_at=$6 WHERE id=$7", user.Email, user.Password, user.TOTPSecret, user.LastLoginAt, user.UpdatedAt, user.DeletedAt, user.ID)
+	_, err := db.Exec("UPDATE users SET email=$1, password=$2, totp_secret=$3, email_confirmation_token=$4, email_confirmed_at=$5, last_login_at=$6, updated_at=$7, deleted_at=$8 WHERE id=$9", user.Email, user.Password, user.TOTPSecret, user.EmailConfirmationToken, user.EmailConfirmedAt, user.LastLoginAt, user.UpdatedAt, user.DeletedAt, user.ID)
 	return err
 }
 
@@ -81,6 +83,12 @@ func (r *UserRepository) Get(id uuid.UUID) (*User, error) {
 func (r *UserRepository) GetByEmail(email string) (*User, error) {
 	user := &User{}
 	err := db.Get(user, "SELECT * FROM users WHERE email=$1", email)
+	return user, err
+}
+
+func (r *UserRepository) GetByConfirmationToken(token string) (*User, error) {
+	user := &User{}
+	err := db.Get(user, "SELECT * FROM users WHERE email_confirmation_token=$1 AND deleted_at IS NULL", token)
 	return user, err
 }
 
@@ -218,6 +226,52 @@ func (s *UserService) CreateWalletForUser(user *User, password string) error {
 	return nil
 }
 
+func (s *UserService) SendEmailConfirmation(user *User) error {
+	// Skip if no notification service available
+	if notificationService == nil {
+		return fmt.Errorf("notification service not available")
+	}
+
+	// Get frontend URL from environment
+	frontendURL := os.Getenv("FRONTEND_URL")
+	if frontendURL == "" {
+		return fmt.Errorf("FRONTEND_URL environment variable not set")
+	}
+
+	// Generate confirmation link
+	confirmationLink := fmt.Sprintf("%s/confirm/%s/%s", frontendURL, user.ID.String(), *user.EmailConfirmationToken)
+
+	// Get email adapter
+	adapter, ok := notificationService.adapters[NotificationChannelEmail]
+	if !ok {
+		return fmt.Errorf("no email adapter available")
+	}
+
+	// Create plain text email content
+	subject := "Confirm Your Email Address - Bitvora Commerce"
+	textBody := fmt.Sprintf(`Hi there!
+
+Welcome to Bitvora Commerce! Please confirm your email address to complete your registration.
+
+Click the link below to confirm your email:
+%s
+
+If you did not create an account, you can safely ignore this email.
+
+This confirmation link will expire in 24 hours.
+
+Best regards,
+The Bitvora Commerce Team`, confirmationLink)
+
+	// Send plain text email (empty HTML body)
+	err := adapter.Send(user.Email, subject, "", textBody)
+	if err != nil {
+		return fmt.Errorf("failed to send confirmation email: %w", err)
+	}
+
+	return nil
+}
+
 func (s *UserService) Update(user *User) error {
 	if user.Password != "" {
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
@@ -262,6 +316,14 @@ func (s *UserService) GetByEmail(email string) (*User, error) {
 	return user, err
 }
 
+func (s *UserService) GetByConfirmationToken(token string) (*User, error) {
+	user, err := userRepository.GetByConfirmationToken(token)
+	if err == nil && user != nil {
+		userCache.Set(user)
+	}
+	return user, err
+}
+
 func (h *UserHandler) Register(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Email           string `json:"email" validate:"required,email"`
@@ -279,17 +341,31 @@ func (h *UserHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Generate email confirmation token
+	confirmationToken := uuid.NewString()
+
 	user := &User{
-		ID:        uuid.New(),
-		Email:     input.Email,
-		Password:  input.Password,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:                     uuid.New(),
+		Email:                  input.Email,
+		Password:               input.Password,
+		EmailConfirmationToken: &confirmationToken,
+		EmailConfirmedAt:       nil, // Not confirmed yet
+		CreatedAt:              time.Now(),
+		UpdatedAt:              time.Now(),
 	}
 	createdUser, err := userService.Create(user)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Send email confirmation
+	err = userService.SendEmailConfirmation(createdUser)
+	if err != nil {
+		// Log the error but don't fail registration if email sending fails
+		logger.Error("Failed to send confirmation email", "error", err.Error(), "user_id", createdUser.ID, "email", createdUser.Email)
+	} else {
+		logger.Info("Confirmation email sent successfully", "user_id", createdUser.ID, "email", createdUser.Email)
 	}
 
 	// After successfully creating the user, attempt to create a wallet
@@ -300,7 +376,18 @@ func (h *UserHandler) Register(w http.ResponseWriter, r *http.Request) {
 		logger.Error("Failed to create wallet for new user", "error", err.Error(), "user_id", createdUser.ID)
 	}
 
-	JsonResponse(w, http.StatusCreated, "User created successfully", createdUser)
+	// Return user data without sensitive information
+	response := struct {
+		ID        uuid.UUID `json:"id"`
+		Email     string    `json:"email"`
+		CreatedAt time.Time `json:"created_at"`
+	}{
+		ID:        createdUser.ID,
+		Email:     createdUser.Email,
+		CreatedAt: createdUser.CreatedAt,
+	}
+
+	JsonResponse(w, http.StatusCreated, "User created successfully. Please check your email to confirm your account.", response)
 }
 
 func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
@@ -318,9 +405,16 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
 		return
 	}
+
 	user, err := userService.GetByEmail(input.Email)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)) != nil {
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	// Check if email is confirmed
+	if user.EmailConfirmedAt == nil {
+		JsonResponse(w, http.StatusPreconditionFailed, "Email not confirmed", "Please check your email and click the confirmation link before logging in.")
 		return
 	}
 
@@ -396,4 +490,126 @@ func (h *UserHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	JsonResponse(w, http.StatusOK, "User dashboard data", response)
+}
+
+func (h *UserHandler) ConfirmEmail(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		UserID            string `json:"user_id" validate:"required"`
+		ConfirmationToken string `json:"confirmation_token" validate:"required"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	if err := h.Validator.Struct(input); err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	userID, err := uuid.Parse(input.UserID)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid user ID format", err.Error())
+		return
+	}
+
+	// Get user by confirmation token to verify it matches
+	user, err := userService.GetByConfirmationToken(input.ConfirmationToken)
+	if err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid or expired confirmation token", err.Error())
+		return
+	}
+
+	// Verify the user ID matches
+	if user.ID != userID {
+		JsonResponse(w, http.StatusBadRequest, "Invalid confirmation token for this user", nil)
+		return
+	}
+
+	// Check if already confirmed
+	if user.EmailConfirmedAt != nil {
+		JsonResponse(w, http.StatusBadRequest, "Email already confirmed", nil)
+		return
+	}
+
+	// Confirm the email
+	now := time.Now()
+	user.EmailConfirmedAt = &now
+	user.EmailConfirmationToken = nil // Clear the token
+	user.UpdatedAt = now
+
+	err = userService.Update(user)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Failed to confirm email", err.Error())
+		return
+	}
+
+	// Create a session for automatic login
+	session := &Session{
+		ID:           uuid.New(),
+		UserID:       user.ID,
+		SessionToken: uuid.NewString(),
+		LoggedInAt:   time.Now(),
+		Status:       "active",
+	}
+
+	newSession, err := sessionRepository.Create(session)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Email confirmed but failed to create session", err.Error())
+		return
+	}
+
+	JsonResponse(w, http.StatusOK, "Email confirmed successfully", newSession)
+}
+
+func (h *UserHandler) ResendConfirmation(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Email string `json:"email" validate:"required,email"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	if err := h.Validator.Struct(input); err != nil {
+		JsonResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+
+	user, err := userService.GetByEmail(input.Email)
+	if err != nil {
+		// Don't reveal if email exists or not for security
+		JsonResponse(w, http.StatusOK, "If the email exists and is not confirmed, a new confirmation email will be sent", nil)
+		return
+	}
+
+	// Check if already confirmed
+	if user.EmailConfirmedAt != nil {
+		JsonResponse(w, http.StatusBadRequest, "Email is already confirmed", nil)
+		return
+	}
+
+	// Generate new confirmation token
+	newToken := uuid.NewString()
+	user.EmailConfirmationToken = &newToken
+	user.UpdatedAt = time.Now()
+
+	err = userService.Update(user)
+	if err != nil {
+		JsonResponse(w, http.StatusInternalServerError, "Failed to update user", err.Error())
+		return
+	}
+
+	// Send new confirmation email
+	err = userService.SendEmailConfirmation(user)
+	if err != nil {
+		logger.Error("Failed to resend confirmation email", "error", err.Error(), "user_id", user.ID, "email", user.Email)
+		JsonResponse(w, http.StatusInternalServerError, "Failed to send confirmation email", err.Error())
+		return
+	}
+
+	logger.Info("Confirmation email resent successfully", "user_id", user.ID, "email", user.Email)
+	JsonResponse(w, http.StatusOK, "Confirmation email sent successfully", nil)
 }

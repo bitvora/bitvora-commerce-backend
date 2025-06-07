@@ -1,0 +1,45 @@
+server {
+    listen 80;
+    listen [::]:80;
+    server_name api.commerce.bitvora.com;
+
+    # Logging
+    access_log /var/log/nginx/api.commerce.bitvora.com.access.log;
+    error_log /var/log/nginx/api.commerce.bitvora.com.error.log;
+
+    # Client upload limit
+    client_max_body_size 100M;
+
+    # Basic security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    # Proxy settings for Go API backend
+    location / {
+        # Proxy to Go backend on port 2121
+        proxy_pass http://127.0.0.1:2121;
+        
+        # Essential proxy headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    # Health check endpoint (optional)
+    location /health {
+        proxy_pass http://127.0.0.1:2121/health;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # Disable access logging for health checks
+        access_log off;
+    }
+} 
