@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -273,7 +274,8 @@ The Bitvora Commerce Team`, confirmationLink)
 }
 
 func (s *UserService) Update(user *User) error {
-	if user.Password != "" {
+	// Only hash the password if it's not empty AND it's not already a bcrypt hash
+	if user.Password != "" && !strings.HasPrefix(user.Password, "$2") {
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
 		if err != nil {
 			return err
@@ -407,7 +409,13 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user, err := userService.GetByEmail(input.Email)
-	if err != nil || bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)) != nil {
+	if err != nil {
+		logger.Error("could not get user by email", "error", err.Error(), "email", input.Email)
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)) != nil {
+		logger.Error("hashed password does not match", "email", input.Email)
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}

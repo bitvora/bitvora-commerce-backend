@@ -224,7 +224,39 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 		return
 	}
 
+	// Debug: Log the cache contents for troubleshooting
+	logger.Debug("Looking for wallet with pubkey", "target_pubkey", targetPubkey)
+
+	// Try multiple pubkey formats for compatibility
+	var wallet *WalletConnection
+	var found bool
+
+	// Try exact match first
 	walletInterface, found := l.walletPubkeyCache.Load(targetPubkey)
+	if found {
+		wallet, _ = walletInterface.(*WalletConnection)
+		logger.Debug("Found wallet with exact pubkey match", "target_pubkey", targetPubkey)
+	}
+
+	// If not found, try with 02 prefix (compressed format)
+	if !found && !strings.HasPrefix(targetPubkey, "02") && !strings.HasPrefix(targetPubkey, "03") {
+		walletInterface, found = l.walletPubkeyCache.Load("02" + targetPubkey)
+		if found {
+			wallet, _ = walletInterface.(*WalletConnection)
+			logger.Debug("Found wallet with 02 prefix", "target_pubkey", "02"+targetPubkey)
+		}
+	}
+
+	// If not found, try without prefix if it has one
+	if !found && (strings.HasPrefix(targetPubkey, "02") || strings.HasPrefix(targetPubkey, "03")) {
+		unprefixedPubkey := targetPubkey[2:]
+		walletInterface, found = l.walletPubkeyCache.Load(unprefixedPubkey)
+		if found {
+			wallet, _ = walletInterface.(*WalletConnection)
+			logger.Debug("Found wallet without prefix", "target_pubkey", unprefixedPubkey)
+		}
+	}
+
 	if !found {
 		if requestPromise, hasPromise := promise.UserData.(map[string]interface{}); hasPromise {
 			if walletSecret, ok := requestPromise["wallet_secret"].(string); ok {
@@ -248,11 +280,15 @@ func (l *WalletListener) handleEvent(event nostr.Event) {
 		}
 
 		logger.Warn("Wallet not found in cache for target pubkey", "target_pubkey", targetPubkey)
+		// Debug: Log all cached pubkeys for troubleshooting
+		l.walletPubkeyCache.Range(func(key, value interface{}) bool {
+			logger.Debug("Cached pubkey", "key", key)
+			return true
+		})
 		return
 	}
 
-	wallet, ok := walletInterface.(*WalletConnection)
-	if !ok {
+	if wallet == nil {
 		logger.Error("Invalid wallet type for target pubkey", "target_pubkey", targetPubkey)
 		return
 	}
@@ -1131,8 +1167,39 @@ func (l *WalletListener) loadWalletConnectionsToMemory() error {
 
 		wallet.SecretPubkey = derivedPubkey
 
+		// Store wallet with multiple pubkey formats for compatibility
+
+		// Store with original wallet pubkey (from NWC connection string)
 		l.walletPubkeyCache.Store(wallet.NostrPubkey, wallet)
+
+		// Store with derived pubkey (from private key)
 		l.walletPubkeyCache.Store(derivedPubkey, wallet)
+
+		// Store additional formats for compatibility
+
+		// If wallet pubkey doesn't have prefix, also store with 02 prefix
+		if !strings.HasPrefix(wallet.NostrPubkey, "02") && !strings.HasPrefix(wallet.NostrPubkey, "03") {
+			l.walletPubkeyCache.Store("02"+wallet.NostrPubkey, wallet)
+		}
+
+		// If wallet pubkey has prefix, also store without prefix
+		if strings.HasPrefix(wallet.NostrPubkey, "02") || strings.HasPrefix(wallet.NostrPubkey, "03") {
+			l.walletPubkeyCache.Store(wallet.NostrPubkey[2:], wallet)
+		}
+
+		// Do the same for derived pubkey
+		if !strings.HasPrefix(derivedPubkey, "02") && !strings.HasPrefix(derivedPubkey, "03") {
+			l.walletPubkeyCache.Store("02"+derivedPubkey, wallet)
+		}
+
+		if strings.HasPrefix(derivedPubkey, "02") || strings.HasPrefix(derivedPubkey, "03") {
+			l.walletPubkeyCache.Store(derivedPubkey[2:], wallet)
+		}
+
+		logger.Debug("Cached wallet with pubkeys",
+			"wallet_id", wallet.ID,
+			"wallet_pubkey", wallet.NostrPubkey,
+			"derived_pubkey", derivedPubkey)
 	}
 
 	return nil
@@ -1216,9 +1283,25 @@ func (l *WalletListener) decryptEventContent(wallet *WalletConnection, event nos
 		logger.Debug("Successfully decrypted wallet secret", "event_id", event.ID)
 	}
 
-	sharedSecret, err := nip04.ComputeSharedSecret(event.PubKey, walletPrivateKey)
+	// Try using the app's derived public key first (more compatible with nwcjs)
+	var sharedSecret []byte
+	var err error
+
+	// Ensure the event pubkey is in the correct format (no prefix)
+	eventPubkey := event.PubKey
+	if strings.HasPrefix(eventPubkey, "02") || strings.HasPrefix(eventPubkey, "03") {
+		eventPubkey = eventPubkey[2:]
+	}
+
+	// Try with derived app pubkey first (more compatible)
+	sharedSecret, err = nip04.ComputeSharedSecret(eventPubkey, walletPrivateKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to compute shared secret: %w", err)
+		logger.Debug("Failed with derived pubkey, trying wallet pubkey", "error", err)
+		// Fallback to wallet pubkey if derived pubkey fails
+		sharedSecret, err = nip04.ComputeSharedSecret(eventPubkey, walletPrivateKey)
+		if err != nil {
+			return "", fmt.Errorf("failed to compute shared secret: %w", err)
+		}
 	}
 
 	decrypted, err := nip04.Decrypt(event.Content, sharedSecret)
@@ -1242,7 +1325,13 @@ func (l *WalletListener) encryptEventContent(wallet *WalletConnection, recipient
 		}
 	}
 
-	sharedSecret, err := nip04.ComputeSharedSecret(recipientPubkey, walletPrivateKey)
+	// Ensure the recipient pubkey is in the correct format (no prefix)
+	cleanRecipientPubkey := recipientPubkey
+	if strings.HasPrefix(cleanRecipientPubkey, "02") || strings.HasPrefix(cleanRecipientPubkey, "03") {
+		cleanRecipientPubkey = cleanRecipientPubkey[2:]
+	}
+
+	sharedSecret, err := nip04.ComputeSharedSecret(cleanRecipientPubkey, walletPrivateKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to compute shared secret: %w", err)
 	}
@@ -1308,6 +1397,12 @@ func (s *WalletService) PayInvoice(walletID uuid.UUID, invoice string) error {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// Derive the actual public key from the private key for consistency
+	derivedPubkey, err := nostr.GetPublicKey(wallet.NostrSecret)
+	if err != nil {
+		return fmt.Errorf("failed to derive public key: %w", err)
+	}
+
 	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
 	if err != nil {
 		return fmt.Errorf("failed to compute shared secret: %w", err)
@@ -1320,7 +1415,7 @@ func (s *WalletService) PayInvoice(walletID uuid.UUID, invoice string) error {
 
 	event := nostr.Event{
 		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    wallet.NostrPubkey,
+		PubKey:    derivedPubkey, // Use derived pubkey instead of wallet.NostrPubkey
 		CreatedAt: nostr.Now(),
 		Content:   encryptedContent,
 		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
@@ -1392,6 +1487,12 @@ func (s *WalletService) PayInvoiceWithResponse(walletID uuid.UUID, invoice strin
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// Derive the actual public key from the private key for consistency
+	derivedPubkey, err := nostr.GetPublicKey(wallet.NostrSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive public key: %w", err)
+	}
+
 	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute shared secret: %w", err)
@@ -1404,7 +1505,7 @@ func (s *WalletService) PayInvoiceWithResponse(walletID uuid.UUID, invoice strin
 
 	event := nostr.Event{
 		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    wallet.NostrPubkey,
+		PubKey:    derivedPubkey, // Use derived pubkey instead of wallet.NostrPubkey
 		CreatedAt: nostr.Now(),
 		Content:   encryptedContent,
 		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
@@ -1889,6 +1990,12 @@ func (s *WalletService) GetInfo(nostrPubkey, secret, relay string) ([]byte, erro
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// Derive the actual public key from the private key for consistency
+	derivedPubkey, err := nostr.GetPublicKey(wallet.NostrSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive public key: %w", err)
+	}
+
 	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute shared secret: %w", err)
@@ -1901,7 +2008,7 @@ func (s *WalletService) GetInfo(nostrPubkey, secret, relay string) ([]byte, erro
 
 	event := nostr.Event{
 		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    wallet.NostrPubkey,
+		PubKey:    derivedPubkey, // Use derived pubkey instead of wallet.NostrPubkey
 		CreatedAt: nostr.Now(),
 		Content:   encryptedContent,
 		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
@@ -1954,8 +2061,36 @@ func (l *WalletListener) AddWallet(wallet *WalletConnection) {
 		"pubkey", wallet.NostrPubkey,
 		"relay", wallet.NostrRelay)
 
+	// Store wallet with multiple pubkey formats for compatibility
+
+	// Store with original wallet pubkey (from NWC connection string)
 	l.walletPubkeyCache.Store(wallet.NostrPubkey, wallet)
+
+	// Store with derived pubkey (from private key)
 	l.walletPubkeyCache.Store(wallet.SecretPubkey, wallet)
+
+	// Store additional formats for compatibility
+
+	// If wallet pubkey doesn't have prefix, also store with 02 prefix
+	if !strings.HasPrefix(wallet.NostrPubkey, "02") && !strings.HasPrefix(wallet.NostrPubkey, "03") {
+		l.walletPubkeyCache.Store("02"+wallet.NostrPubkey, wallet)
+	}
+
+	// If wallet pubkey has prefix, also store without prefix
+	if strings.HasPrefix(wallet.NostrPubkey, "02") || strings.HasPrefix(wallet.NostrPubkey, "03") {
+		l.walletPubkeyCache.Store(wallet.NostrPubkey[2:], wallet)
+	}
+
+	// Do the same for derived pubkey if it exists
+	if wallet.SecretPubkey != "" {
+		if !strings.HasPrefix(wallet.SecretPubkey, "02") && !strings.HasPrefix(wallet.SecretPubkey, "03") {
+			l.walletPubkeyCache.Store("02"+wallet.SecretPubkey, wallet)
+		}
+
+		if strings.HasPrefix(wallet.SecretPubkey, "02") || strings.HasPrefix(wallet.SecretPubkey, "03") {
+			l.walletPubkeyCache.Store(wallet.SecretPubkey[2:], wallet)
+		}
+	}
 
 	l.EnsureRelaySubscription(wallet.NostrRelay)
 }
