@@ -54,6 +54,12 @@ func CombinedAuthMiddleware(next http.Handler) http.Handler {
 				return
 			}
 
+			// Check if email is confirmed
+			if user.EmailConfirmedAt == nil {
+				JsonResponse(w, http.StatusPreconditionFailed, "Email not confirmed", "Please check your email and click the confirmation link to access your account.")
+				return
+			}
+
 			ctx := context.WithValue(r.Context(), UserContextKey, user)
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
@@ -70,6 +76,12 @@ func CombinedAuthMiddleware(next http.Handler) http.Handler {
 			user, err := userService.Get(apiKey.UserID)
 			if err != nil {
 				JsonResponse(w, http.StatusUnauthorized, "Unauthorized", "User not found")
+				return
+			}
+
+			// Check if email is confirmed
+			if user.EmailConfirmedAt == nil {
+				JsonResponse(w, http.StatusPreconditionFailed, "Email not confirmed", "Please check your email and click the confirmation link to access your account.")
 				return
 			}
 

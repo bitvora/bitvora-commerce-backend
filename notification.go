@@ -28,6 +28,7 @@ const (
 	NotificationEventCheckoutUnderpaid NotificationEvent = "checkout.underpaid"
 	NotificationEventCheckoutOverpaid  NotificationEvent = "checkout.overpaid"
 	NotificationEventCheckoutExpired   NotificationEvent = "checkout.expired"
+	NotificationEventEmailConfirmation NotificationEvent = "email.confirmation"
 )
 
 var AllNotificationEvents = []NotificationEvent{
@@ -36,6 +37,7 @@ var AllNotificationEvents = []NotificationEvent{
 	NotificationEventCheckoutUnderpaid,
 	NotificationEventCheckoutOverpaid,
 	NotificationEventCheckoutExpired,
+	NotificationEventEmailConfirmation,
 }
 
 type NotificationChannelType string
@@ -331,6 +333,7 @@ func (s *NotificationService) loadTemplates() {
 		NotificationEventCheckoutUnderpaid: "checkout_underpaid.html",
 		NotificationEventCheckoutOverpaid:  "checkout_overpaid.html",
 		NotificationEventCheckoutExpired:   "checkout_expired.html",
+		NotificationEventEmailConfirmation: "email_confirmation.html",
 	}
 
 	for event, filename := range templateFiles {
@@ -534,6 +537,15 @@ func (s *NotificationService) prepareTemplateData(event NotificationEvent, data 
 			templateData["Amount"] = float64(checkout.Amount) / 100000000
 			templateData["CreatedAt"] = checkout.CreatedAt.Format("January 2, 2006 at 3:04 PM")
 			templateData["UpdatedAt"] = checkout.UpdatedAt.Format("January 2, 2006 at 3:04 PM")
+		}
+
+	case NotificationEventEmailConfirmation:
+		confirmationData, ok := data.(map[string]interface{})
+		if ok {
+			subject = "Confirm Your Email Address"
+			templateData["Title"] = "Email Confirmation"
+			templateData["Subject"] = subject
+			templateData["ConfirmationLink"] = confirmationData["confirmation_link"]
 		}
 
 	default:

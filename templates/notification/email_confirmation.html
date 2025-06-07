@@ -1,0 +1,10 @@
+{{define "content"}}
+<h1>{{.Title}}</h1>
+<p>Welcome to Bitvora Commerce! Please confirm your email address to complete your registration.</p>
+<p>Click the link below to confirm your email:</p>
+<p><a href="{{.ConfirmationLink}}" style="background-color: #007bff; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Confirm Email Address</a></p>
+<p>Or copy and paste this link into your browser:</p>
+<p>{{.ConfirmationLink}}</p>
+<p>This confirmation link will expire in 24 hours.</p>
+<p>If you did not create an account, you can safely ignore this email.</p>
+{{end}} 

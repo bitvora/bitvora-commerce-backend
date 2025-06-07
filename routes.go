@@ -30,6 +30,8 @@ func InitRoutes() http.Handler {
 	r.Post("/register", userHandler.Register)
 	r.Post("/login", userHandler.Login)
 	r.Post("/logout", userHandler.Logout)
+	r.Post("/confirm_email", userHandler.ConfirmEmail)
+	r.Post("/resend_confirmation", userHandler.ResendConfirmation)
 	r.Get("/l/{id}", paymentLinkHandler.PublicLinkHandler)
 	r.Get("/c/{id}", checkoutHandler.PublicLinkHandler)
 	r.Get("/c/{id}/poll", checkoutHandler.PollInvoice)

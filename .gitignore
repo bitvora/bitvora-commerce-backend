@@ -4,3 +4,4 @@
 .env.production
 .env.test
 .env.test.local
+bitvora-commerce-backend
