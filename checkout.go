@@ -734,6 +734,11 @@ func (h *CheckoutHandler) ConnectWallet(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Ensure the customer's relay is connected to the wallet listener immediately
+	if walletListener != nil {
+		walletListener.EnsureRelaySubscription(parsedWallet.NostrRelay)
+	}
+
 	// Verify this wallet supports necessary methods
 	info, err := walletService.GetInfo(parsedWallet.NostrPubkey, parsedWallet.NostrSecret, parsedWallet.NostrRelay)
 	if err != nil {
@@ -938,7 +943,8 @@ func processSubscriptionCreation(checkout *Checkout, wallet *WalletConnection) {
 
 	logger.Info("Created subscription from checkout",
 		"checkout_id", checkout.ID,
-		"subscription_id", subscriptionSvc.ID)
+		"subscription_id", subscriptionSvc.ID,
+		"relay", wallet.NostrRelay)
 }
 
 func init() {

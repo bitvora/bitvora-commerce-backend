@@ -1124,6 +1124,7 @@ func (l *WalletListener) Start() error {
 		return fmt.Errorf("failed to load wallet connections to memory: %w", err)
 	}
 
+	// Get relays from active wallet connections
 	wallets, err := walletRepository.GetActiveWalletConnections()
 	if err != nil {
 		return fmt.Errorf("failed to load active wallet connections: %w", err)
@@ -1134,6 +1135,15 @@ func (l *WalletListener) Start() error {
 		relays = append(relays, wallet.NostrRelay)
 	}
 
+	// Get relays from active subscriptions
+	subscriptionRelays, err := l.getActiveSubscriptionRelays()
+	if err != nil {
+		logger.Warn("Failed to get subscription relays, continuing with wallet relays only", "error", err)
+	} else {
+		relays = append(relays, subscriptionRelays...)
+	}
+
+	// Remove duplicates
 	relayMap := make(map[string]struct{})
 	uniqueRelays := make([]string, 0)
 	for _, relay := range relays {
@@ -1146,6 +1156,27 @@ func (l *WalletListener) Start() error {
 	l.SubscribeToRelays(uniqueRelays)
 
 	return nil
+}
+
+// getActiveSubscriptionRelays gets all unique relay URLs from active subscriptions
+func (l *WalletListener) getActiveSubscriptionRelays() ([]string, error) {
+	var relays []string
+
+	// Query for active subscriptions with relay information
+	err := db.Select(&relays, `
+		SELECT DISTINCT nostr_relay 
+		FROM subscriptions 
+		WHERE status = $1 
+		AND nostr_relay IS NOT NULL 
+		AND nostr_relay != ''
+		AND deleted_at IS NULL`,
+		SubscriptionStatusActive)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get subscription relays: %w", err)
+	}
+
+	return relays, nil
 }
 
 func (l *WalletListener) loadWalletConnectionsToMemory() error {
@@ -2239,4 +2270,45 @@ func (s *WalletService) PayLightningAddress(walletID uuid.UUID, lightningAddress
 	response["original_amount_sats"] = amountSats
 
 	return response, nil
+}
+
+// RefreshSubscriptionRelays connects to new subscription relays
+func (l *WalletListener) RefreshSubscriptionRelays() error {
+	subscriptionRelays, err := l.getActiveSubscriptionRelays()
+	if err != nil {
+		return fmt.Errorf("failed to get subscription relays: %w", err)
+	}
+
+	for _, relay := range subscriptionRelays {
+		l.EnsureRelaySubscription(relay)
+	}
+
+	return nil
+}
+
+// AddSubscriptionRelay ensures a specific subscription relay is connected
+func (l *WalletListener) AddSubscriptionRelay(relay string) {
+	if relay != "" {
+		l.EnsureRelaySubscription(relay)
+	}
+}
+
+// RefreshAllRelayConnections refreshes both wallet and subscription relay connections
+func (s *WalletService) RefreshAllRelayConnections() error {
+	if walletListener != nil {
+		// Refresh wallet connections cache
+		err := walletListener.loadWalletConnectionsToMemory()
+		if err != nil {
+			logger.Warn("Failed to refresh wallet connections cache", "error", err)
+		}
+
+		// Refresh subscription relay connections
+		err = walletListener.RefreshSubscriptionRelays()
+		if err != nil {
+			logger.Warn("Failed to refresh subscription relays", "error", err)
+		}
+
+		return nil
+	}
+	return fmt.Errorf("wallet listener not initialized")
 }
