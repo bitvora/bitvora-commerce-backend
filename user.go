@@ -240,7 +240,7 @@ func (s *UserService) SendEmailConfirmation(user *User) error {
 	}
 
 	// Generate confirmation link
-	confirmationLink := fmt.Sprintf("%s/confirm/%s/%s", frontendURL, user.ID.String(), *user.EmailConfirmationToken)
+	confirmationLink := fmt.Sprintf("%s/auth/email-verification?id=%s&token=%s", frontendURL, user.ID.String(), *user.EmailConfirmationToken)
 
 	// Get email adapter
 	adapter, ok := notificationService.adapters[NotificationChannelEmail]
