@@ -485,6 +485,8 @@ func (s *WalletService) Create(wallet *WalletConnection) (*WalletConnection, err
 
 	wallet.Methods = methodsJson
 
+	logger.Info("Wallet methods", "methods", response.Result.Methods)
+
 	if !slices.Contains(response.Result.Methods, "get_info") {
 		return nil, fmt.Errorf("wallet does not support get_info")
 	}
