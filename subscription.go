@@ -198,11 +198,6 @@ func (s *SubscriptionService) Create(subscription *Subscription) (*Subscription,
 		return nil, err
 	}
 
-	// If this subscription has a relay, ensure it's connected to the wallet listener
-	if createdSubscription.NostrRelay != nil && walletListener != nil {
-		walletListener.AddSubscriptionRelay(*createdSubscription.NostrRelay)
-	}
-
 	return createdSubscription, nil
 }
 
@@ -212,11 +207,6 @@ func (s *SubscriptionService) Update(subscription *Subscription) error {
 	err := subscriptionRepository.Update(subscription)
 	if err != nil {
 		return err
-	}
-
-	// If this subscription has a relay, ensure it's connected to the wallet listener
-	if subscription.NostrRelay != nil && walletListener != nil {
-		walletListener.AddSubscriptionRelay(*subscription.NostrRelay)
 	}
 
 	return nil
@@ -259,12 +249,6 @@ func (s *SubscriptionService) ProcessSubscriptionPayment(subscription *Subscript
 	sellerWallet, err := walletService.GetActiveWalletByAccount(subscription.AccountID)
 	if err != nil {
 		return fmt.Errorf("failed to get seller wallet: %w", err)
-	}
-
-	// Ensure both seller and customer relays are connected to the wallet listener
-	if walletListener != nil {
-		walletListener.EnsureRelaySubscription(sellerWallet.NostrRelay)
-		walletListener.EnsureRelaySubscription(*subscription.NostrRelay)
 	}
 
 	// Get current exchange rates

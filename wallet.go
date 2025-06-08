@@ -129,7 +129,188 @@ type WalletService struct{}
 var walletRepository = &WalletRepository{}
 var walletCache = &WalletCache{}
 var walletService = &WalletService{}
-var walletListener = NewWalletListener()
+
+// NWCRequest represents a Nostr Wallet Connect request
+type NWCRequest struct {
+	Method string      `json:"method"`
+	Params interface{} `json:"params,omitempty"`
+}
+
+// NWCResponse represents a Nostr Wallet Connect response
+type NWCResponse struct {
+	ResultType string          `json:"result_type"`
+	Error      *NWCError       `json:"error,omitempty"`
+	Result     json.RawMessage `json:"result,omitempty"`
+}
+
+// NWCError represents an error in NWC response
+type NWCError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// sendNWCRequest sends a request to a wallet using request-specific subscription
+func sendNWCRequest(ctx context.Context, wallet *WalletConnection, method string, params interface{}, timeout time.Duration) (json.RawMessage, error) {
+	logger.Debug("Preparing NWC request", "method", method, "wallet_id", wallet.ID, "relay", wallet.NostrRelay)
+
+	// Prepare the request
+	req := NWCRequest{
+		Method: method,
+		Params: params,
+	}
+
+	reqBytes, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Get the client secret key (wallet secret)
+	clientSecretKey := wallet.NostrSecret
+	if len(clientSecretKey) != 64 && len(clientSecretKey) != 32 {
+		clientSecretKey, err = decrypt(wallet.NostrSecret)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt wallet secret: %w", err)
+		}
+	}
+
+	// Derive client public key
+	clientPubKey, err := nostr.GetPublicKey(clientSecretKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive client public key: %w", err)
+	}
+
+	// Compute shared secret for encryption - try with prefix first for compatibility
+	walletPubKeyWithPrefix := "02" + wallet.NostrPubkey
+	sharedSecret, err := nip04.ComputeSharedSecret(walletPubKeyWithPrefix, clientSecretKey)
+	if err != nil {
+		// Fallback to without prefix
+		sharedSecret, err = nip04.ComputeSharedSecret(wallet.NostrPubkey, clientSecretKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compute shared secret: %w", err)
+		}
+	}
+
+	// Encrypt the request
+	encryptedContent, err := nip04.Encrypt(string(reqBytes), sharedSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt request: %w", err)
+	}
+
+	// Create the event
+	event := nostr.Event{
+		Kind:      nostr.KindNWCWalletRequest,
+		PubKey:    clientPubKey,
+		CreatedAt: nostr.Now(),
+		Content:   encryptedContent,
+		Tags: nostr.Tags{
+			nostr.Tag{"p", wallet.NostrPubkey},
+		},
+	}
+
+	// Sign the event
+	event.Sign(clientSecretKey)
+
+	// Validate signature
+	if ok, err := event.CheckSignature(); !ok || err != nil {
+		return nil, fmt.Errorf("event signature validation failed: %v, %w", ok, err)
+	}
+
+	// Create a simple pool for this request
+	pool := nostr.NewSimplePool(ctx)
+
+	// Set up response subscription BEFORE sending request
+	responseFilters := nostr.Filter{
+		Kinds: []int{nostr.KindNWCWalletResponse},
+		Tags: nostr.TagMap{
+			"e": []string{event.ID},     // Filter by our request event ID
+			"p": []string{clientPubKey}, // Filter by our client pubkey
+		},
+		Limit: 1, // Only need one response
+	}
+
+	responseSub := pool.SubscribeMany(ctx, []string{wallet.NostrRelay}, responseFilters)
+
+	// Set up response channel
+	responseChan := make(chan nostr.Event, 1)
+	go func() {
+		defer close(responseChan)
+		for evt := range responseSub {
+			if evt.Event != nil {
+				logger.Debug("Received response event", "response_event_id", evt.Event.ID, "request_event_id", event.ID)
+				responseChan <- *evt.Event
+				break // Only need one response
+			}
+		}
+	}()
+
+	// Publish the request
+	status := pool.PublishMany(ctx, []string{wallet.NostrRelay}, event)
+	if stat := <-status; stat.Error != nil {
+		return nil, fmt.Errorf("failed to publish event to %s: %w", wallet.NostrRelay, stat.Error)
+	}
+
+	logger.Info("Sent NWC request", "method", method, "event_id", event.ID, "relay", wallet.NostrRelay)
+
+	// Wait for response with timeout
+	timeoutTimer := time.NewTimer(timeout)
+	defer timeoutTimer.Stop()
+
+	select {
+	case resp := <-responseChan:
+		logger.Debug("Received response", "response_event_id", resp.ID)
+
+		// Decrypt the response
+		decrypted, err := decryptNWCResponse(resp, clientSecretKey, wallet.NostrPubkey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt response: %w", err)
+		}
+
+		// Parse the response
+		var nwcResp NWCResponse
+		if err := json.Unmarshal([]byte(decrypted), &nwcResp); err != nil {
+			return nil, fmt.Errorf("failed to parse NWC response: %w", err)
+		}
+
+		// Check for errors
+		if nwcResp.Error != nil {
+			return nil, fmt.Errorf("wallet error: %s - %s", nwcResp.Error.Code, nwcResp.Error.Message)
+		}
+
+		return nwcResp.Result, nil
+
+	case <-timeoutTimer.C:
+		return nil, fmt.Errorf("request timed out after %v", timeout)
+	}
+}
+
+// decryptNWCResponse decrypts a response event content
+func decryptNWCResponse(event nostr.Event, clientSecKey, walletPubKey string) (string, error) {
+	logger.Debug("Decrypting response", "event_id", event.ID, "event_pubkey", event.PubKey)
+
+	// Use the actual response pubkey for decryption
+	responsePubKey := event.PubKey
+	if event.PubKey != walletPubKey {
+		logger.Debug("Response pubkey differs from wallet pubkey", "expected", walletPubKey, "actual", event.PubKey)
+	}
+
+	// Try with prefix first for compatibility
+	responsePubKeyWithPrefix := "02" + responsePubKey
+	sharedSecret, err := nip04.ComputeSharedSecret(responsePubKeyWithPrefix, clientSecKey)
+	if err != nil {
+		// Fallback to without prefix
+		sharedSecret, err = nip04.ComputeSharedSecret(responsePubKey, clientSecKey)
+		if err != nil {
+			return "", fmt.Errorf("failed to compute shared secret for decryption: %w", err)
+		}
+	}
+
+	decrypted, err := nip04.Decrypt(event.Content, sharedSecret)
+	if err != nil {
+		return "", fmt.Errorf("failed to decrypt content: %w", err)
+	}
+
+	return decrypted, nil
+}
 
 type ResponsePromise struct {
 	Response chan []byte
@@ -137,213 +318,7 @@ type ResponsePromise struct {
 	UserData interface{}
 }
 
-type WalletListener struct {
-	pool              *nostr.SimplePool
-	ctx               context.Context
-	cancelFunc        context.CancelFunc
-	connections       sync.Map
-	walletCache       *WalletCache
-	walletPubkeyCache sync.Map
-	pendingRequests   sync.Map
-}
-
-func NewWalletListener() *WalletListener {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &WalletListener{
-		pool:              nostr.NewSimplePool(ctx),
-		ctx:               ctx,
-		cancelFunc:        cancel,
-		connections:       sync.Map{},
-		walletCache:       walletCache,
-		walletPubkeyCache: sync.Map{},
-		pendingRequests:   sync.Map{},
-	}
-}
-
-func (l *WalletListener) WaitForResponse(eventID string, timeout time.Duration, userData interface{}) ([]byte, error) {
-	responseChan := make(chan []byte, 1)
-	timer := time.NewTimer(timeout)
-
-	l.pendingRequests.Store(eventID, &ResponsePromise{
-		Response: responseChan,
-		Timeout:  timer,
-		UserData: userData,
-	})
-
-	defer func() {
-		timer.Stop()
-		l.pendingRequests.Delete(eventID)
-	}()
-
-	select {
-	case response := <-responseChan:
-		return response, nil
-	case <-timer.C:
-		return nil, fmt.Errorf("request timed out after %v", timeout)
-	}
-}
-
-func (l *WalletListener) handleEvent(event nostr.Event) {
-	logger.Debug("Received event", "event_id", event.ID, "pubkey", event.PubKey, "content", event.Content, "with tags", event.Tags)
-
-	// raw json nostr note:
-	logger.Debug("Raw JSON nostr note", "event", event)
-	var requestID string
-	for _, tag := range event.Tags {
-		if len(tag) >= 2 && tag[0] == "e" {
-			requestID = tag[1]
-			break
-		}
-	}
-	if requestID == "" {
-		logger.Debug("No request ID found in event", "event_id", event.ID)
-		return
-	}
-
-	promiseInterface, exists := l.pendingRequests.Load(requestID)
-	if !exists {
-		logger.Debug("No pending request found for request ID", "request_id", requestID)
-		return
-	}
-
-	promise, ok := promiseInterface.(*ResponsePromise)
-	if !ok {
-		logger.Error("Invalid promise type for request ID", "request_id", requestID)
-		return
-	}
-
-	var targetPubkey string
-	for _, ptag := range event.Tags {
-		if len(ptag) >= 2 && ptag[0] == "p" {
-			targetPubkey = ptag[1]
-			break
-		}
-	}
-	if targetPubkey == "" {
-		logger.Warn("No target pubkey found in event", "event_id", event.ID)
-		return
-	}
-
-	// Debug: Log the cache contents for troubleshooting
-	logger.Debug("Looking for wallet with pubkey", "target_pubkey", targetPubkey)
-
-	// Try multiple pubkey formats for compatibility
-	var wallet *WalletConnection
-	var found bool
-
-	// Try exact match first
-	walletInterface, found := l.walletPubkeyCache.Load(targetPubkey)
-	if found {
-		wallet, _ = walletInterface.(*WalletConnection)
-		logger.Debug("Found wallet with exact pubkey match", "target_pubkey", targetPubkey)
-	}
-
-	// If not found, try with 02 prefix (compressed format)
-	if !found && !strings.HasPrefix(targetPubkey, "02") && !strings.HasPrefix(targetPubkey, "03") {
-		walletInterface, found = l.walletPubkeyCache.Load("02" + targetPubkey)
-		if found {
-			wallet, _ = walletInterface.(*WalletConnection)
-			logger.Debug("Found wallet with 02 prefix", "target_pubkey", "02"+targetPubkey)
-		}
-	}
-
-	// If not found, try without prefix if it has one
-	if !found && (strings.HasPrefix(targetPubkey, "02") || strings.HasPrefix(targetPubkey, "03")) {
-		unprefixedPubkey := targetPubkey[2:]
-		walletInterface, found = l.walletPubkeyCache.Load(unprefixedPubkey)
-		if found {
-			wallet, _ = walletInterface.(*WalletConnection)
-			logger.Debug("Found wallet without prefix", "target_pubkey", unprefixedPubkey)
-		}
-	}
-
-	if !found {
-		if requestPromise, hasPromise := promise.UserData.(map[string]interface{}); hasPromise {
-			if walletSecret, ok := requestPromise["wallet_secret"].(string); ok {
-				logger.Debug("Using temporary wallet data for get_info response", "target_pubkey", targetPubkey)
-
-				sharedSecret, err := nip04.ComputeSharedSecret(event.PubKey, walletSecret)
-				if err != nil {
-					logger.Error("Failed to compute shared secret for temp wallet", "error", err)
-					return
-				}
-
-				decrypted, err := nip04.Decrypt(event.Content, sharedSecret)
-				if err != nil {
-					logger.Error("Failed to decrypt event content for temp wallet", "error", err)
-					return
-				}
-
-				promise.Response <- []byte(decrypted)
-				return
-			}
-		}
-
-		logger.Warn("Wallet not found in cache for target pubkey", "target_pubkey", targetPubkey)
-		// Debug: Log all cached pubkeys for troubleshooting
-		l.walletPubkeyCache.Range(func(key, value interface{}) bool {
-			logger.Debug("Cached pubkey", "key", key)
-			return true
-		})
-		return
-	}
-
-	if wallet == nil {
-		logger.Error("Invalid wallet type for target pubkey", "target_pubkey", targetPubkey)
-		return
-	}
-
-	decryptedContent, err := l.decryptEventContent(wallet, event)
-	if err != nil {
-		logger.Error("Failed to decrypt event content", "event_id", event.ID, "error", err)
-		return
-	}
-
-	logger.Debug("Decrypted event content", "event_id", event.ID, "decrypted_content", decryptedContent)
-	var paymentResponse struct {
-		Result struct {
-			PaymentHash string `json:"payment_hash"`
-			Amount      int64  `json:"amount_msat"`
-			Preimage    string `json:"preimage"`
-			Invoice     string `json:"invoice,omitempty"`
-		} `json:"result"`
-		Error *struct{} `json:"error,omitempty"`
-	}
-
-	if err := json.Unmarshal([]byte(decryptedContent), &paymentResponse); err != nil {
-		logger.Error("Failed to parse JSON from decrypted content", "event_id", event.ID, "error", err)
-		return
-	}
-
-	if paymentResponse.Error != nil {
-		logger.Warn("Payment error received", "event_id", event.ID, "error", paymentResponse.Error)
-		// Send the error response to the waiting promise so it doesn't timeout
-		promise.Response <- []byte(decryptedContent)
-		return
-	}
-
-	checkouts := []*Checkout{}
-	err = db.Select(&checkouts, "SELECT * FROM checkouts WHERE lightning_invoice=$1 AND state=$2",
-		paymentResponse.Result.Invoice, CheckoutStateOpen)
-
-	if err == nil && len(checkouts) > 0 {
-		for _, checkout := range checkouts {
-			newState := CheckoutStatePaid
-			receivedAmount := paymentResponse.Result.Amount
-
-			if receivedAmount < checkout.Amount {
-				newState = CheckoutStateUnderpaid
-			} else if receivedAmount > checkout.Amount {
-				newState = CheckoutStateOverpaid
-			}
-
-			checkoutService.UpdateState(checkout.ID, newState, receivedAmount)
-			logger.Info("Updated checkout state", "checkout_id", checkout.ID, "new_state", newState, "received_amount", receivedAmount)
-		}
-	}
-
-	promise.Response <- []byte(decryptedContent)
-}
+// NewWalletListener is no longer needed with request-specific connections
 
 func (r *WalletRepository) Create(wallet *WalletConnection) (*WalletConnection, error) {
 	originalSecret := wallet.NostrSecret
@@ -509,7 +484,7 @@ func (s *WalletService) Create(wallet *WalletConnection) (*WalletConnection, err
 		createdWallet.NostrSecret = plainTextSecret
 		walletCache.Set(createdWallet)
 
-		walletListener.AddWallet(createdWallet)
+		// Wallet is ready to use immediately - no need for listener
 	}
 	return createdWallet, err
 }
@@ -1118,265 +1093,6 @@ func determineRecipientType(recipient string) string {
 	return "unknown"
 }
 
-func (l *WalletListener) Start() error {
-	err := l.loadWalletConnectionsToMemory()
-	if err != nil {
-		return fmt.Errorf("failed to load wallet connections to memory: %w", err)
-	}
-
-	// Get relays from active wallet connections
-	wallets, err := walletRepository.GetActiveWalletConnections()
-	if err != nil {
-		return fmt.Errorf("failed to load active wallet connections: %w", err)
-	}
-
-	relays := make([]string, 0)
-	for _, wallet := range wallets {
-		relays = append(relays, wallet.NostrRelay)
-	}
-
-	// Get relays from active subscriptions
-	subscriptionRelays, err := l.getActiveSubscriptionRelays()
-	if err != nil {
-		logger.Warn("Failed to get subscription relays, continuing with wallet relays only", "error", err)
-	} else {
-		relays = append(relays, subscriptionRelays...)
-	}
-
-	// Remove duplicates
-	relayMap := make(map[string]struct{})
-	uniqueRelays := make([]string, 0)
-	for _, relay := range relays {
-		if _, exists := relayMap[relay]; !exists {
-			relayMap[relay] = struct{}{}
-			uniqueRelays = append(uniqueRelays, relay)
-		}
-	}
-
-	l.SubscribeToRelays(uniqueRelays)
-
-	return nil
-}
-
-// getActiveSubscriptionRelays gets all unique relay URLs from active subscriptions
-func (l *WalletListener) getActiveSubscriptionRelays() ([]string, error) {
-	var relays []string
-
-	// Query for active subscriptions with relay information
-	err := db.Select(&relays, `
-		SELECT DISTINCT nostr_relay 
-		FROM subscriptions 
-		WHERE status = $1 
-		AND nostr_relay IS NOT NULL 
-		AND nostr_relay != ''
-		AND deleted_at IS NULL`,
-		SubscriptionStatusActive)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to get subscription relays: %w", err)
-	}
-
-	return relays, nil
-}
-
-func (l *WalletListener) loadWalletConnectionsToMemory() error {
-	l.walletPubkeyCache = sync.Map{}
-
-	wallets, err := walletRepository.GetActiveWalletConnections()
-	if err != nil {
-		return err
-	}
-
-	for _, wallet := range wallets {
-		decryptedSecret, err := decrypt(wallet.NostrSecret)
-		if err != nil {
-			continue
-		}
-
-		derivedPubkey, err := nostr.GetPublicKey(decryptedSecret)
-		if err != nil {
-			continue
-		}
-
-		wallet.SecretPubkey = derivedPubkey
-
-		// Store wallet with multiple pubkey formats for compatibility
-
-		// Store with original wallet pubkey (from NWC connection string)
-		l.walletPubkeyCache.Store(wallet.NostrPubkey, wallet)
-
-		// Store with derived pubkey (from private key)
-		l.walletPubkeyCache.Store(derivedPubkey, wallet)
-
-		// Store additional formats for compatibility
-
-		// If wallet pubkey doesn't have prefix, also store with 02 prefix
-		if !strings.HasPrefix(wallet.NostrPubkey, "02") && !strings.HasPrefix(wallet.NostrPubkey, "03") {
-			l.walletPubkeyCache.Store("02"+wallet.NostrPubkey, wallet)
-		}
-
-		// If wallet pubkey has prefix, also store without prefix
-		if strings.HasPrefix(wallet.NostrPubkey, "02") || strings.HasPrefix(wallet.NostrPubkey, "03") {
-			l.walletPubkeyCache.Store(wallet.NostrPubkey[2:], wallet)
-		}
-
-		// Do the same for derived pubkey
-		if !strings.HasPrefix(derivedPubkey, "02") && !strings.HasPrefix(derivedPubkey, "03") {
-			l.walletPubkeyCache.Store("02"+derivedPubkey, wallet)
-		}
-
-		if strings.HasPrefix(derivedPubkey, "02") || strings.HasPrefix(derivedPubkey, "03") {
-			l.walletPubkeyCache.Store(derivedPubkey[2:], wallet)
-		}
-
-		logger.Debug("Cached wallet with pubkeys",
-			"wallet_id", wallet.ID,
-			"wallet_pubkey", wallet.NostrPubkey,
-			"derived_pubkey", derivedPubkey)
-	}
-
-	return nil
-}
-
-func (l *WalletListener) Stop() {
-	l.cancelFunc()
-	l.connections.Range(func(key, value interface{}) bool {
-		if cancel, ok := value.(context.CancelFunc); ok {
-			cancel()
-		}
-		return true
-	})
-}
-
-func (l *WalletListener) SubscribeToRelays(relayURLs []string) {
-	for _, relay := range relayURLs {
-		l.EnsureRelaySubscription(relay)
-	}
-}
-
-func (l *WalletListener) EnsureRelaySubscription(relayURL string) {
-	relayKey := fmt.Sprintf("relay:%s", relayURL)
-	_, isSubscribed := l.connections.Load(relayKey)
-
-	if !isSubscribed {
-		logger.Info("Ensuring subscription to relay", "relay", relayURL)
-
-		ctx, cancel := context.WithCancel(l.ctx)
-		l.connections.Store(relayKey, cancel)
-
-		walletKinds := []int{
-			nostr.KindNWCWalletInfo,
-			nostr.KindNWCWalletRequest,
-			nostr.KindNWCWalletResponse,
-		}
-
-		since := nostr.Timestamp(time.Now().Unix())
-		filters := nostr.Filter{
-			Kinds: walletKinds,
-			Since: &since,
-		}
-
-		go func() {
-			sub := l.pool.SubscribeMany(ctx, []string{relayURL}, filters)
-			logger.Debug("Started relay subscription", "relay", relayURL)
-
-			for event := range sub {
-				if event.Event == nil {
-					continue
-				}
-
-				l.handleEvent(*event.Event)
-			}
-
-			logger.Info("Relay subscription ended", "relay", relayURL)
-		}()
-
-		// Give the subscription a moment to establish
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func (l *WalletListener) decryptEventContent(wallet *WalletConnection, event nostr.Event) (string, error) {
-	logger.Debug("Attempting to decrypt event content",
-		"event_id", event.ID,
-		"wallet_id", wallet.ID,
-		"wallet_pubkey", wallet.NostrPubkey,
-		"secret_length", len(wallet.NostrSecret))
-
-	var walletPrivateKey string
-
-	if len(wallet.NostrSecret) == 64 || len(wallet.NostrSecret) == 32 {
-		walletPrivateKey = wallet.NostrSecret
-	} else {
-		var err error
-		walletPrivateKey, err = decrypt(wallet.NostrSecret)
-		if err != nil {
-			return "", fmt.Errorf("failed to decrypt wallet secret: %w", err)
-		}
-		logger.Debug("Successfully decrypted wallet secret", "event_id", event.ID)
-	}
-
-	// Try using the app's derived public key first (more compatible with nwcjs)
-	var sharedSecret []byte
-	var err error
-
-	// Ensure the event pubkey is in the correct format (no prefix)
-	eventPubkey := event.PubKey
-	if strings.HasPrefix(eventPubkey, "02") || strings.HasPrefix(eventPubkey, "03") {
-		eventPubkey = eventPubkey[2:]
-	}
-
-	// Try with derived app pubkey first (more compatible)
-	sharedSecret, err = nip04.ComputeSharedSecret(eventPubkey, walletPrivateKey)
-	if err != nil {
-		logger.Debug("Failed with derived pubkey, trying wallet pubkey", "error", err)
-		// Fallback to wallet pubkey if derived pubkey fails
-		sharedSecret, err = nip04.ComputeSharedSecret(eventPubkey, walletPrivateKey)
-		if err != nil {
-			return "", fmt.Errorf("failed to compute shared secret: %w", err)
-		}
-	}
-
-	decrypted, err := nip04.Decrypt(event.Content, sharedSecret)
-	if err != nil {
-		return "", fmt.Errorf("failed to decrypt content: %w", err)
-	}
-
-	return decrypted, nil
-}
-
-func (l *WalletListener) encryptEventContent(wallet *WalletConnection, recipientPubkey, content string) (string, error) {
-	var walletPrivateKey string
-
-	if len(wallet.NostrSecret) == 64 || len(wallet.NostrSecret) == 32 {
-		walletPrivateKey = wallet.NostrSecret
-	} else {
-		var err error
-		walletPrivateKey, err = decrypt(wallet.NostrSecret)
-		if err != nil {
-			return "", fmt.Errorf("failed to decrypt wallet secret: %w", err)
-		}
-	}
-
-	// Ensure the recipient pubkey is in the correct format (no prefix)
-	cleanRecipientPubkey := recipientPubkey
-	if strings.HasPrefix(cleanRecipientPubkey, "02") || strings.HasPrefix(cleanRecipientPubkey, "03") {
-		cleanRecipientPubkey = cleanRecipientPubkey[2:]
-	}
-
-	sharedSecret, err := nip04.ComputeSharedSecret(cleanRecipientPubkey, walletPrivateKey)
-	if err != nil {
-		return "", fmt.Errorf("failed to compute shared secret: %w", err)
-	}
-
-	encrypted, err := nip04.Encrypt(content, sharedSecret)
-	if err != nil {
-		return "", fmt.Errorf("failed to encrypt content: %w", err)
-	}
-
-	return encrypted, nil
-}
-
 func (s *WalletService) PublishEvent(walletID uuid.UUID, kind int, content string, tags nostr.Tags) error {
 	wallet, err := s.Get(walletID)
 	if err != nil {
@@ -1411,85 +1127,13 @@ func (s *WalletService) PayInvoice(walletID uuid.UUID, invoice string) error {
 		return err
 	}
 
-	request := struct {
-		Method string `json:"method"`
-		Params struct {
-			Invoice string `json:"invoice"`
-		} `json:"params"`
-	}{
-		Method: "pay_invoice",
-		Params: struct {
-			Invoice string `json:"invoice"`
-		}{
-			Invoice: invoice,
-		},
+	params := map[string]interface{}{
+		"invoice": invoice,
 	}
 
-	requestJSON, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	// Derive the actual public key from the private key for consistency
-	derivedPubkey, err := nostr.GetPublicKey(wallet.NostrSecret)
-	if err != nil {
-		return fmt.Errorf("failed to derive public key: %w", err)
-	}
-
-	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
-	if err != nil {
-		return fmt.Errorf("failed to compute shared secret: %w", err)
-	}
-
-	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
-	if err != nil {
-		return fmt.Errorf("failed to encrypt content: %w", err)
-	}
-
-	event := nostr.Event{
-		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    derivedPubkey, // Use derived pubkey instead of wallet.NostrPubkey
-		CreatedAt: nostr.Now(),
-		Content:   encryptedContent,
-		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
-	}
-
-	event.Sign(wallet.NostrSecret)
-
-	if walletListener != nil {
-		walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
-
-		responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second, nil)
-		if err != nil {
-			return fmt.Errorf("error waiting for payment: %w", err)
-		}
-
-		var response struct {
-			Result struct {
-				Preimage string `json:"preimage"`
-				FeesPaid int64  `json:"fees_paid"`
-			} `json:"result"`
-			Error *struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			} `json:"error,omitempty"`
-		}
-
-		if err := json.Unmarshal(responseData, &response); err != nil {
-			return fmt.Errorf("failed to parse payment response: %w", err)
-		}
-
-		if response.Error != nil {
-			return fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
-		}
-
-		return nil
-	} else {
-		ctx := context.Background()
-		pool := nostr.NewSimplePool(ctx)
-		pool.PublishMany(ctx, []string{wallet.NostrRelay}, event)
-		return fmt.Errorf("wallet listener not initialized, cannot wait for response")
-	}
+	ctx := context.Background()
+	_, err = sendNWCRequest(ctx, wallet, "pay_invoice", params, 30*time.Second)
+	return err
 }
 
 // PayInvoiceWithResponse pays a lightning invoice and returns the full response data including preimage
@@ -1501,177 +1145,52 @@ func (s *WalletService) PayInvoiceWithResponse(walletID uuid.UUID, invoice strin
 
 	logger.Info("Paying invoice", "wallet_id", walletID, "invoice", invoice)
 
-	request := struct {
-		Method string `json:"method"`
-		Params struct {
-			Invoice string `json:"invoice"`
-		} `json:"params"`
-	}{
-		Method: "pay_invoice",
-		Params: struct {
-			Invoice string `json:"invoice"`
-		}{
-			Invoice: invoice,
-		},
+	params := map[string]interface{}{
+		"invoice": invoice,
 	}
 
-	requestJSON, err := json.Marshal(request)
+	ctx := context.Background()
+	result, err := sendNWCRequest(ctx, wallet, "pay_invoice", params, 30*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, err
 	}
 
-	// Derive the actual public key from the private key for consistency
-	derivedPubkey, err := nostr.GetPublicKey(wallet.NostrSecret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to derive public key: %w", err)
+	// Parse the result
+	var payResult struct {
+		Preimage string `json:"preimage"`
+		FeesPaid int64  `json:"fees_paid"`
 	}
 
-	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compute shared secret: %w", err)
-	}
-
-	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt content: %w", err)
-	}
-
-	event := nostr.Event{
-		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    derivedPubkey, // Use derived pubkey instead of wallet.NostrPubkey
-		CreatedAt: nostr.Now(),
-		Content:   encryptedContent,
-		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
-	}
-
-	event.Sign(wallet.NostrSecret)
-
-	if walletListener == nil {
-		return nil, fmt.Errorf("wallet listener not initialized, cannot wait for response")
-	}
-
-	walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
-
-	responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second, nil)
-	if err != nil {
-		return nil, fmt.Errorf("error waiting for payment response: %w", err)
-	}
-
-	var response struct {
-		Result struct {
-			Preimage string `json:"preimage"`
-			FeesPaid int64  `json:"fees_paid"`
-		} `json:"result"`
-		Error *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-
-	if err := json.Unmarshal(responseData, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse payment response: %w", err)
-	}
-
-	if response.Error != nil {
-		return nil, fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
+	if err := json.Unmarshal(result, &payResult); err != nil {
+		return nil, fmt.Errorf("failed to parse pay_invoice result: %w", err)
 	}
 
 	// Return the full response data
-	result := map[string]interface{}{
-		"preimage":  response.Result.Preimage,
-		"fees_paid": response.Result.FeesPaid,
+	response := map[string]interface{}{
+		"preimage":  payResult.Preimage,
+		"fees_paid": payResult.FeesPaid,
 		"invoice":   invoice,
 		"wallet_id": walletID,
 	}
 
-	return result, nil
+	return response, nil
 }
 
 func (s *WalletService) PayInvoiceWithConnection(pubkey, secret, relay, invoice string) error {
-	// Create a request to pay the invoice
-	request := struct {
-		Method string `json:"method"`
-		Params struct {
-			Invoice string `json:"invoice"`
-		} `json:"params"`
-	}{
-		Method: "pay_invoice",
-		Params: struct {
-			Invoice string `json:"invoice"`
-		}{
-			Invoice: invoice,
-		},
+	// Create temporary wallet connection
+	wallet := &WalletConnection{
+		NostrPubkey: pubkey,
+		NostrSecret: secret,
+		NostrRelay:  relay,
 	}
 
-	requestJSON, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
+	params := map[string]interface{}{
+		"invoice": invoice,
 	}
 
-	sharedSecret, err := nip04.ComputeSharedSecret(pubkey, secret)
-	if err != nil {
-		return fmt.Errorf("failed to compute shared secret: %w", err)
-	}
-
-	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
-	if err != nil {
-		return fmt.Errorf("failed to encrypt content: %w", err)
-	}
-
-	event := nostr.Event{
-		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    pubkey,
-		CreatedAt: nostr.Now(),
-		Content:   encryptedContent,
-		Tags:      nostr.Tags{nostr.Tag{"p", pubkey}},
-	}
-
-	event.Sign(secret)
-
-	// Ensure we have a subscription to this relay
-	if walletListener != nil {
-		walletListener.EnsureRelaySubscription(relay)
-
-		ctx := context.Background()
-		pool := nostr.NewSimplePool(ctx)
-		pool.PublishMany(ctx, []string{relay}, event)
-
-		// Create map to hold temp wallet data
-		tempData := map[string]interface{}{
-			"wallet_secret": secret,
-		}
-
-		responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second, tempData)
-		if err != nil {
-			return fmt.Errorf("error waiting for payment response: %w", err)
-		}
-
-		var response struct {
-			Result struct {
-				Preimage string `json:"preimage"`
-				FeesPaid int64  `json:"fees_paid"`
-			} `json:"result"`
-			Error *struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			} `json:"error,omitempty"`
-		}
-
-		if err := json.Unmarshal(responseData, &response); err != nil {
-			return fmt.Errorf("failed to parse payment response: %w", err)
-		}
-
-		if response.Error != nil {
-			return fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
-		}
-
-		return nil
-	} else {
-		ctx := context.Background()
-		pool := nostr.NewSimplePool(ctx)
-		pool.PublishMany(ctx, []string{relay}, event)
-		return fmt.Errorf("wallet listener not initialized, cannot wait for response")
-	}
+	ctx := context.Background()
+	_, err := sendNWCRequest(ctx, wallet, "pay_invoice", params, 30*time.Second)
+	return err
 }
 
 func (s *WalletService) MakeInvoice(walletID uuid.UUID, amountMsat int64, description string, expiry int64) (string, error) {
@@ -1680,84 +1199,28 @@ func (s *WalletService) MakeInvoice(walletID uuid.UUID, amountMsat int64, descri
 		return "", err
 	}
 
-	request := struct {
-		Method string `json:"method"`
-		Params struct {
-			Amount      int64  `json:"amount"`
-			Description string `json:"description"`
-			Expiry      int64  `json:"expiry"`
-		} `json:"params"`
-	}{
-		Method: "make_invoice",
-		Params: struct {
-			Amount      int64  `json:"amount"`
-			Description string `json:"description"`
-			Expiry      int64  `json:"expiry"`
-		}{
-			Amount:      amountMsat,
-			Description: description,
-			Expiry:      expiry,
-		},
+	params := map[string]interface{}{
+		"amount":      amountMsat,
+		"description": description,
+		"expiry":      expiry,
 	}
 
-	requestJSON, err := json.Marshal(request)
+	ctx := context.Background()
+	result, err := sendNWCRequest(ctx, wallet, "make_invoice", params, 30*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		return "", err
 	}
 
-	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
-	if err != nil {
-		return "", fmt.Errorf("failed to compute shared secret: %w", err)
+	// Parse the result
+	var invoiceResult struct {
+		Invoice string `json:"invoice"`
 	}
 
-	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
-	if err != nil {
-		return "", fmt.Errorf("failed to encrypt content: %w", err)
+	if err := json.Unmarshal(result, &invoiceResult); err != nil {
+		return "", fmt.Errorf("failed to parse make_invoice result: %w", err)
 	}
 
-	event := nostr.Event{
-		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    wallet.NostrPubkey,
-		CreatedAt: nostr.Now(),
-		Content:   encryptedContent,
-		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
-	}
-
-	event.Sign(wallet.NostrSecret)
-
-	if walletListener != nil {
-		walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
-
-		responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second, nil)
-		if err != nil {
-			return "", fmt.Errorf("error waiting for invoice: %w", err)
-		}
-
-		var response struct {
-			Result struct {
-				Invoice string `json:"invoice"`
-			} `json:"result"`
-			Error *struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			} `json:"error,omitempty"`
-		}
-
-		if err := json.Unmarshal(responseData, &response); err != nil {
-			return "", fmt.Errorf("failed to parse invoice response: %w", err)
-		}
-
-		if response.Error != nil {
-			return "", fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
-		}
-
-		return response.Result.Invoice, nil
-	} else {
-		ctx := context.Background()
-		pool := nostr.NewSimplePool(ctx)
-		pool.PublishMany(ctx, []string{wallet.NostrRelay}, event)
-		return "", fmt.Errorf("wallet listener not initialized, cannot wait for response")
-	}
+	return invoiceResult.Invoice, nil
 }
 
 func (s *WalletService) MakeChainAddress(walletID uuid.UUID) (string, error) {
@@ -1766,75 +1229,22 @@ func (s *WalletService) MakeChainAddress(walletID uuid.UUID) (string, error) {
 		return "", err
 	}
 
-	request := struct {
-		Method string `json:"method"`
-		Params struct {
-		} `json:"params"`
-	}{
-		Method: "make_chain_address",
-		Params: struct{}{},
-	}
-
-	requestJSON, err := json.Marshal(request)
+	ctx := context.Background()
+	result, err := sendNWCRequest(ctx, wallet, "make_chain_address", nil, 30*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		return "", err
 	}
 
-	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
-	if err != nil {
-		return "", fmt.Errorf("failed to compute shared secret: %w", err)
+	// Parse the result
+	var addressResult struct {
+		Address string `json:"address"`
 	}
 
-	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
-	if err != nil {
-		return "", fmt.Errorf("failed to encrypt content: %w", err)
+	if err := json.Unmarshal(result, &addressResult); err != nil {
+		return "", fmt.Errorf("failed to parse make_chain_address result: %w", err)
 	}
 
-	event := nostr.Event{
-		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    wallet.NostrPubkey,
-		CreatedAt: nostr.Now(),
-		Content:   encryptedContent,
-		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
-	}
-
-	event.Sign(wallet.NostrSecret)
-
-	if walletListener != nil {
-		walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
-	}
-
-	responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second, nil)
-	if err != nil {
-		return "", fmt.Errorf("error waiting for chain address: %w", err)
-	}
-
-	var response struct {
-		Result struct {
-			Address string `json:"address"`
-		} `json:"result"`
-		Error *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-
-	if err := json.Unmarshal(responseData, &response); err != nil {
-		return "", fmt.Errorf("failed to parse chain address response: %w", err)
-	}
-
-	if response.Error != nil {
-		return "", fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
-	}
-
-	return response.Result.Address, nil
-}
-
-func (s *WalletService) UpdateWalletConnectionsCache() error {
-	if walletListener != nil {
-		return walletListener.loadWalletConnectionsToMemory()
-	}
-	return nil
+	return addressResult.Address, nil
 }
 
 func (s *WalletService) ListTransactions(walletID uuid.UUID, from, until int64, limit, offset int, unpaid bool, txType string) ([]byte, error) {
@@ -1864,67 +1274,19 @@ func (s *WalletService) ListTransactions(walletID uuid.UUID, from, until int64, 
 		params["type"] = txType
 	}
 
-	request := struct {
-		Method string                 `json:"method"`
-		Params map[string]interface{} `json:"params"`
-	}{
-		Method: "list_transactions",
-		Params: params,
-	}
-
-	requestJSON, err := json.Marshal(request)
+	ctx := context.Background()
+	result, err := sendNWCRequest(ctx, wallet, "list_transactions", params, 30*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, err
 	}
 
-	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compute shared secret: %w", err)
+	// Create a full NWC response structure for compatibility
+	fullResponse := NWCResponse{
+		ResultType: "list_transactions",
+		Result:     result,
 	}
 
-	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt content: %w", err)
-	}
-
-	event := nostr.Event{
-		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    wallet.NostrPubkey,
-		CreatedAt: nostr.Now(),
-		Content:   encryptedContent,
-		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
-	}
-
-	event.Sign(wallet.NostrSecret)
-
-	if walletListener != nil {
-		walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
-
-		responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second, nil)
-		if err != nil {
-			return nil, fmt.Errorf("error waiting for transactions: %w", err)
-		}
-
-		var response struct {
-			Result json.RawMessage `json:"result"`
-			Error  *struct {
-				Code    string `json:"code"`
-				Message string `json:"message"`
-			} `json:"error,omitempty"`
-		}
-
-		if err := json.Unmarshal(responseData, &response); err != nil {
-			return nil, fmt.Errorf("failed to parse transaction list response: %w", err)
-		}
-
-		if response.Error != nil {
-			return nil, fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
-		}
-
-		return responseData, nil
-	}
-
-	return nil, fmt.Errorf("wallet listener not initialized, cannot wait for response")
+	return json.Marshal(fullResponse)
 }
 
 func (s *WalletService) GetBalance(walletID uuid.UUID) (int64, error) {
@@ -1933,199 +1295,45 @@ func (s *WalletService) GetBalance(walletID uuid.UUID) (int64, error) {
 		return 0, err
 	}
 
-	request := struct {
-		Method string   `json:"method"`
-		Params struct{} `json:"params"`
-	}{
-		Method: "get_balance",
-		Params: struct{}{},
-	}
-
-	requestJSON, err := json.Marshal(request)
+	ctx := context.Background()
+	result, err := sendNWCRequest(ctx, wallet, "get_balance", nil, 30*time.Second)
 	if err != nil {
-		return 0, fmt.Errorf("failed to marshal request: %w", err)
+		return 0, err
 	}
 
-	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
-	if err != nil {
-		return 0, fmt.Errorf("failed to compute shared secret: %w", err)
+	// Parse the result
+	var balanceResult struct {
+		Balance int64 `json:"balance"`
 	}
 
-	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
-	if err != nil {
-		return 0, fmt.Errorf("failed to encrypt content: %w", err)
+	if err := json.Unmarshal(result, &balanceResult); err != nil {
+		return 0, fmt.Errorf("failed to parse get_balance result: %w", err)
 	}
 
-	event := nostr.Event{
-		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    wallet.NostrPubkey,
-		CreatedAt: nostr.Now(),
-		Content:   encryptedContent,
-		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
-	}
-
-	event.Sign(wallet.NostrSecret)
-
-	if walletListener == nil {
-		return 0, fmt.Errorf("wallet listener not initialized, cannot wait for response")
-	}
-
-	walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
-
-	responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second, nil)
-	if err != nil {
-		return 0, fmt.Errorf("error waiting for balance: %w", err)
-	}
-
-	var response struct {
-		ResultType string `json:"result_type"`
-		Result     struct {
-			Balance int64 `json:"balance"`
-		} `json:"result"`
-		Error *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-
-	if err := json.Unmarshal(responseData, &response); err != nil {
-		return 0, fmt.Errorf("failed to parse balance response: %w", err)
-	}
-
-	if response.Error != nil {
-		return 0, fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
-	}
-
-	return response.Result.Balance, nil
+	return balanceResult.Balance, nil
 }
 
 func (s *WalletService) GetInfo(nostrPubkey, secret, relay string) ([]byte, error) {
-	if walletListener != nil {
-		walletListener.EnsureRelaySubscription(relay)
-	}
-
+	// Create temporary wallet connection
 	wallet := &WalletConnection{
 		NostrPubkey: nostrPubkey,
 		NostrSecret: secret,
 		NostrRelay:  relay,
 	}
 
-	request := struct {
-		Method string   `json:"method"`
-		Params struct{} `json:"params"`
-	}{
-		Method: "get_info",
-		Params: struct{}{},
-	}
-
-	requestJSON, err := json.Marshal(request)
+	ctx := context.Background()
+	result, err := sendNWCRequest(ctx, wallet, "get_info", nil, 30*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, err
 	}
 
-	// Derive the actual public key from the private key for consistency
-	derivedPubkey, err := nostr.GetPublicKey(wallet.NostrSecret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to derive public key: %w", err)
+	// Create a full NWC response structure for compatibility
+	fullResponse := NWCResponse{
+		ResultType: "get_info",
+		Result:     result,
 	}
 
-	sharedSecret, err := nip04.ComputeSharedSecret(wallet.NostrPubkey, wallet.NostrSecret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compute shared secret: %w", err)
-	}
-
-	encryptedContent, err := nip04.Encrypt(string(requestJSON), sharedSecret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt content: %w", err)
-	}
-
-	event := nostr.Event{
-		Kind:      nostr.KindNWCWalletRequest,
-		PubKey:    derivedPubkey, // Use derived pubkey instead of wallet.NostrPubkey
-		CreatedAt: nostr.Now(),
-		Content:   encryptedContent,
-		Tags:      nostr.Tags{nostr.Tag{"p", wallet.NostrPubkey}},
-	}
-
-	event.Sign(wallet.NostrSecret)
-
-	walletListener.pool.PublishMany(walletListener.ctx, []string{wallet.NostrRelay}, event)
-
-	tempData := map[string]interface{}{
-		"wallet_secret": wallet.NostrSecret,
-	}
-	responseData, err := walletListener.WaitForResponse(event.ID, 30*time.Second, tempData)
-	if err != nil {
-		return nil, fmt.Errorf("error waiting for info: %w", err)
-	}
-
-	var response struct {
-		ResultType string `json:"result_type"`
-		Result     struct {
-			Alias         string   `json:"alias"`
-			Color         string   `json:"color"`
-			Pubkey        string   `json:"pubkey"`
-			Network       string   `json:"network"`
-			BlockHeight   int      `json:"block_height"`
-			BlockHash     string   `json:"block_hash"`
-			Methods       []string `json:"methods"`
-			Notifications []string `json:"notifications"`
-		} `json:"result"`
-		Error *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-
-	if err := json.Unmarshal(responseData, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse info response: %w", err)
-	}
-
-	if response.Error != nil {
-		return nil, fmt.Errorf("wallet error: %s - %s", response.Error.Code, response.Error.Message)
-	}
-
-	return responseData, nil
-}
-
-func (l *WalletListener) AddWallet(wallet *WalletConnection) {
-	logger.Info("Adding wallet to listener cache",
-		"wallet_id", wallet.ID,
-		"pubkey", wallet.NostrPubkey,
-		"relay", wallet.NostrRelay)
-
-	// Store wallet with multiple pubkey formats for compatibility
-
-	// Store with original wallet pubkey (from NWC connection string)
-	l.walletPubkeyCache.Store(wallet.NostrPubkey, wallet)
-
-	// Store with derived pubkey (from private key)
-	l.walletPubkeyCache.Store(wallet.SecretPubkey, wallet)
-
-	// Store additional formats for compatibility
-
-	// If wallet pubkey doesn't have prefix, also store with 02 prefix
-	if !strings.HasPrefix(wallet.NostrPubkey, "02") && !strings.HasPrefix(wallet.NostrPubkey, "03") {
-		l.walletPubkeyCache.Store("02"+wallet.NostrPubkey, wallet)
-	}
-
-	// If wallet pubkey has prefix, also store without prefix
-	if strings.HasPrefix(wallet.NostrPubkey, "02") || strings.HasPrefix(wallet.NostrPubkey, "03") {
-		l.walletPubkeyCache.Store(wallet.NostrPubkey[2:], wallet)
-	}
-
-	// Do the same for derived pubkey if it exists
-	if wallet.SecretPubkey != "" {
-		if !strings.HasPrefix(wallet.SecretPubkey, "02") && !strings.HasPrefix(wallet.SecretPubkey, "03") {
-			l.walletPubkeyCache.Store("02"+wallet.SecretPubkey, wallet)
-		}
-
-		if strings.HasPrefix(wallet.SecretPubkey, "02") || strings.HasPrefix(wallet.SecretPubkey, "03") {
-			l.walletPubkeyCache.Store(wallet.SecretPubkey[2:], wallet)
-		}
-	}
-
-	l.EnsureRelaySubscription(wallet.NostrRelay)
+	return json.Marshal(fullResponse)
 }
 
 func (s *WalletService) ParseWalletConnectString(walletConnect string) (*WalletConnection, error) {
@@ -2270,45 +1478,4 @@ func (s *WalletService) PayLightningAddress(walletID uuid.UUID, lightningAddress
 	response["original_amount_sats"] = amountSats
 
 	return response, nil
-}
-
-// RefreshSubscriptionRelays connects to new subscription relays
-func (l *WalletListener) RefreshSubscriptionRelays() error {
-	subscriptionRelays, err := l.getActiveSubscriptionRelays()
-	if err != nil {
-		return fmt.Errorf("failed to get subscription relays: %w", err)
-	}
-
-	for _, relay := range subscriptionRelays {
-		l.EnsureRelaySubscription(relay)
-	}
-
-	return nil
-}
-
-// AddSubscriptionRelay ensures a specific subscription relay is connected
-func (l *WalletListener) AddSubscriptionRelay(relay string) {
-	if relay != "" {
-		l.EnsureRelaySubscription(relay)
-	}
-}
-
-// RefreshAllRelayConnections refreshes both wallet and subscription relay connections
-func (s *WalletService) RefreshAllRelayConnections() error {
-	if walletListener != nil {
-		// Refresh wallet connections cache
-		err := walletListener.loadWalletConnectionsToMemory()
-		if err != nil {
-			logger.Warn("Failed to refresh wallet connections cache", "error", err)
-		}
-
-		// Refresh subscription relay connections
-		err = walletListener.RefreshSubscriptionRelays()
-		if err != nil {
-			logger.Warn("Failed to refresh subscription relays", "error", err)
-		}
-
-		return nil
-	}
-	return fmt.Errorf("wallet listener not initialized")
 }

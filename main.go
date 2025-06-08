@@ -38,7 +38,6 @@ func main() {
 
 	InitDB()
 	r := InitRoutes()
-	go walletListener.Start()
 
 	// Initialize the subscription scheduler
 	InitSubscriptionScheduler()
