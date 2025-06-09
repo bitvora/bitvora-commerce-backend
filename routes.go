@@ -27,11 +27,38 @@ func InitRoutes() http.Handler {
 	r.Use(APIKeyMiddleware)
 
 	r.Get("/", HandleHome)
-	r.Post("/register", userHandler.Register)
-	r.Post("/login", userHandler.Login)
+
+	// Apply rate limiting to public authentication routes (IP-based)
+	r.With(RateLimitMiddleware(RateLimitConfig{
+		MaxRequests: 2,
+		Window:      time.Hour,
+		ByUser:      false,
+		RouteKey:    "register",
+	})).Post("/register", userHandler.Register)
+
+	r.With(RateLimitMiddleware(RateLimitConfig{
+		MaxRequests: 5,
+		Window:      time.Hour,
+		ByUser:      false,
+		RouteKey:    "login",
+	})).Post("/login", userHandler.Login)
+
 	r.Post("/logout", userHandler.Logout)
-	r.Post("/confirm_email", userHandler.ConfirmEmail)
-	r.Post("/resend_confirmation", userHandler.ResendConfirmation)
+
+	r.With(RateLimitMiddleware(RateLimitConfig{
+		MaxRequests: 1,
+		Window:      time.Hour,
+		ByUser:      false,
+		RouteKey:    "confirm_email",
+	})).Post("/confirm_email", userHandler.ConfirmEmail)
+
+	r.With(RateLimitMiddleware(RateLimitConfig{
+		MaxRequests: 1,
+		Window:      time.Hour,
+		ByUser:      false,
+		RouteKey:    "resend_confirmation",
+	})).Post("/resend_confirmation", userHandler.ResendConfirmation)
+
 	r.Get("/l/{id}", paymentLinkHandler.PublicLinkHandler)
 	r.Get("/c/{id}", checkoutHandler.PublicLinkHandler)
 	r.Get("/c/{id}/poll", checkoutHandler.PollInvoice)
@@ -118,9 +145,25 @@ func InitRoutes() http.Handler {
 
 		r.Get("/wallet/balance", walletHandler.GetBalance)
 		r.Get("/wallet/transactions", walletHandler.GetTransactions)
-		r.Post("/wallet/withdraw", walletHandler.Withdraw)
+
+		// Apply rate limiting to wallet withdraw (user-based, 5 per minute)
+		r.With(RateLimitMiddleware(RateLimitConfig{
+			MaxRequests: 5,
+			Window:      time.Minute,
+			ByUser:      true,
+			RouteKey:    "wallet_withdraw",
+		})).Post("/wallet/withdraw", walletHandler.Withdraw)
+
 		r.Post("/invoice", walletHandler.MakeInvoice)
-		r.Post("/checkout", checkoutHandler.Create)
+
+		// Apply rate limiting to checkout creation (user-based, 60 per minute)
+		r.With(RateLimitMiddleware(RateLimitConfig{
+			MaxRequests: 60,
+			Window:      time.Minute,
+			ByUser:      true,
+			RouteKey:    "checkout_create",
+		})).Post("/checkout", checkoutHandler.Create)
+
 		r.Get("/checkout/{id}", checkoutHandler.Get)
 		r.Post("/checkout/{id}/subscribe", checkoutHandler.ConnectWallet)
 		r.Get("/checkout/account/{accountId}", checkoutHandler.GetAllByAccount)
