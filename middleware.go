@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -16,6 +18,168 @@ const (
 	AccountContextKey contextKey = "account"
 	APIKeyContextKey  contextKey = "api_key"
 )
+
+// Rate limiting structures
+type RateLimitEntry struct {
+	Count     int       `json:"count"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
+type RateLimiter struct {
+	ipLimits   sync.Map // map[string]*RateLimitEntry for IP-based limits
+	userLimits sync.Map // map[string]*RateLimitEntry for user-based limits
+	mutex      sync.RWMutex
+}
+
+type RateLimitConfig struct {
+	MaxRequests int           // Maximum number of requests
+	Window      time.Duration // Time window for the limit
+	ByUser      bool          // If true, limit by user ID; if false, limit by IP
+	RouteKey    string        // Unique key for this route's limits
+}
+
+var globalRateLimiter = &RateLimiter{}
+
+// Cleanup routine to remove expired entries
+func (rl *RateLimiter) cleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	go func() {
+		for range ticker.C {
+			now := time.Now()
+
+			// Clean IP limits
+			rl.ipLimits.Range(func(key, value interface{}) bool {
+				entry := value.(*RateLimitEntry)
+				if now.Sub(entry.LastSeen) > time.Hour {
+					rl.ipLimits.Delete(key)
+				}
+				return true
+			})
+
+			// Clean user limits
+			rl.userLimits.Range(func(key, value interface{}) bool {
+				entry := value.(*RateLimitEntry)
+				if now.Sub(entry.LastSeen) > time.Hour {
+					rl.userLimits.Delete(key)
+				}
+				return true
+			})
+		}
+	}()
+}
+
+func init() {
+	globalRateLimiter.cleanup()
+}
+
+// Get client IP address
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header first (in case of proxy)
+	forwarded := r.Header.Get("X-Forwarded-For")
+	if forwarded != "" {
+		// X-Forwarded-For can contain multiple IPs, take the first one
+		ips := strings.Split(forwarded, ",")
+		return strings.TrimSpace(ips[0])
+	}
+
+	// Check X-Real-IP header
+	realIP := r.Header.Get("X-Real-IP")
+	if realIP != "" {
+		return realIP
+	}
+
+	// Fall back to RemoteAddr
+	ip := r.RemoteAddr
+	if colon := strings.LastIndex(ip, ":"); colon != -1 {
+		ip = ip[:colon]
+	}
+	return ip
+}
+
+// Check if request is within rate limit
+func (rl *RateLimiter) IsAllowed(identifier string, config RateLimitConfig) bool {
+	now := time.Now()
+
+	var limits *sync.Map
+	if config.ByUser {
+		limits = &rl.userLimits
+	} else {
+		limits = &rl.ipLimits
+	}
+
+	// Create a unique key combining route and identifier
+	key := config.RouteKey + ":" + identifier
+
+	entryInterface, exists := limits.Load(key)
+
+	if !exists {
+		// First request from this identifier for this route
+		entry := &RateLimitEntry{
+			Count:     1,
+			FirstSeen: now,
+			LastSeen:  now,
+		}
+		limits.Store(key, entry)
+		return true
+	}
+
+	entry := entryInterface.(*RateLimitEntry)
+
+	// Check if we're outside the time window
+	if now.Sub(entry.FirstSeen) >= config.Window {
+		// Reset the window
+		entry.Count = 1
+		entry.FirstSeen = now
+		entry.LastSeen = now
+		return true
+	}
+
+	// We're within the window, check if we've exceeded the limit
+	if entry.Count >= config.MaxRequests {
+		entry.LastSeen = now
+		return false
+	}
+
+	// Increment the counter
+	entry.Count++
+	entry.LastSeen = now
+	return true
+}
+
+// Rate limiting middleware factory
+func RateLimitMiddleware(config RateLimitConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var identifier string
+
+			if config.ByUser {
+				// Try to get user from context for authenticated routes
+				user, err := GetUserFromContext(r.Context())
+				if err != nil {
+					// If no user in context, fall back to IP-based limiting
+					identifier = getClientIP(r)
+				} else {
+					identifier = user.ID.String()
+				}
+			} else {
+				// IP-based limiting
+				identifier = getClientIP(r)
+			}
+
+			if !globalRateLimiter.IsAllowed(identifier, config) {
+				JsonResponse(w, http.StatusTooManyRequests, "Rate limit exceeded", map[string]interface{}{
+					"limit":       config.MaxRequests,
+					"window":      config.Window.String(),
+					"retry_after": int(config.Window.Seconds()),
+				})
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
 
 func CombinedAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
