@@ -91,6 +91,19 @@ func (r *SubscriptionRepository) Create(subscription *Subscription) (*Subscripti
 		return nil, fmt.Errorf("invalid JSON for Metadata")
 	}
 
+	// Store original secret to restore after database operation
+	var originalSecret *string
+	if subscription.NostrSecret != nil {
+		originalSecret = subscription.NostrSecret
+
+		// Encrypt the nostr secret before storing
+		encryptedSecret, err := encrypt(*subscription.NostrSecret)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encrypt nostr secret: %w", err)
+		}
+		subscription.NostrSecret = &encryptedSecret
+	}
+
 	err := db.Get(subscription, `
 		INSERT INTO subscriptions (
 			id, user_id, account_id, customer_id, product_id,
@@ -109,10 +122,29 @@ func (r *SubscriptionRepository) Create(subscription *Subscription) (*Subscripti
 		subscription.LastPaymentDate, subscription.LastPaymentStatus, subscription.FailedPaymentAttempts,
 		subscription.BillingIntervalHours, subscription.Metadata, subscription.NostrRelay, subscription.NostrPubkey,
 		subscription.NostrSecret, subscription.CreatedAt, subscription.UpdatedAt, subscription.DeletedAt)
+
+	// Restore original secret if creation was successful
+	if err == nil && originalSecret != nil {
+		subscription.NostrSecret = originalSecret
+	}
+
 	return subscription, err
 }
 
 func (r *SubscriptionRepository) Update(subscription *Subscription) error {
+	// Store original secret to restore after database operation
+	var originalSecret *string
+	if subscription.NostrSecret != nil {
+		originalSecret = subscription.NostrSecret
+
+		// Encrypt the nostr secret before storing
+		encryptedSecret, err := encrypt(*subscription.NostrSecret)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt nostr secret: %w", err)
+		}
+		subscription.NostrSecret = &encryptedSecret
+	}
+
 	_, err := db.Exec(`
 		UPDATE subscriptions SET 
 			billing_start_date=$1, active_on_date=$2, status=$3, 
@@ -126,37 +158,116 @@ func (r *SubscriptionRepository) Update(subscription *Subscription) error {
 		subscription.FailedPaymentAttempts, subscription.BillingIntervalHours, subscription.Metadata,
 		subscription.NostrRelay, subscription.NostrPubkey, subscription.NostrSecret,
 		subscription.UpdatedAt, subscription.DeletedAt, subscription.ID)
+
+	// Restore original secret if update was successful
+	if err == nil && originalSecret != nil {
+		subscription.NostrSecret = originalSecret
+	}
+
 	return err
 }
 
 func (r *SubscriptionRepository) Get(id uuid.UUID) (*Subscription, error) {
 	subscription := &Subscription{}
 	err := db.Get(subscription, "SELECT * FROM subscriptions WHERE id=$1 AND deleted_at IS NULL", id)
-	return subscription, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt the nostr secret if it exists
+	if subscription.NostrSecret != nil && *subscription.NostrSecret != "" {
+		decryptedSecret, err := decrypt(*subscription.NostrSecret)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt nostr secret: %w", err)
+		}
+		subscription.NostrSecret = &decryptedSecret
+	}
+
+	return subscription, nil
 }
 
 func (r *SubscriptionRepository) GetByUser(userID uuid.UUID) ([]*Subscription, error) {
 	subscriptions := []*Subscription{}
 	err := db.Select(&subscriptions, "SELECT * FROM subscriptions WHERE user_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC", userID)
-	return subscriptions, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt the nostr secret for each subscription
+	for _, subscription := range subscriptions {
+		if subscription.NostrSecret != nil && *subscription.NostrSecret != "" {
+			decryptedSecret, err := decrypt(*subscription.NostrSecret)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decrypt nostr secret: %w", err)
+			}
+			subscription.NostrSecret = &decryptedSecret
+		}
+	}
+
+	return subscriptions, nil
 }
 
 func (r *SubscriptionRepository) GetByAccount(accountID uuid.UUID) ([]*Subscription, error) {
 	subscriptions := []*Subscription{}
 	err := db.Select(&subscriptions, "SELECT * FROM subscriptions WHERE account_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC", accountID)
-	return subscriptions, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt the nostr secret for each subscription
+	for _, subscription := range subscriptions {
+		if subscription.NostrSecret != nil && *subscription.NostrSecret != "" {
+			decryptedSecret, err := decrypt(*subscription.NostrSecret)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decrypt nostr secret: %w", err)
+			}
+			subscription.NostrSecret = &decryptedSecret
+		}
+	}
+
+	return subscriptions, nil
 }
 
 func (r *SubscriptionRepository) GetByCustomer(customerID uuid.UUID) ([]*Subscription, error) {
 	subscriptions := []*Subscription{}
 	err := db.Select(&subscriptions, "SELECT * FROM subscriptions WHERE customer_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC", customerID)
-	return subscriptions, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt the nostr secret for each subscription
+	for _, subscription := range subscriptions {
+		if subscription.NostrSecret != nil && *subscription.NostrSecret != "" {
+			decryptedSecret, err := decrypt(*subscription.NostrSecret)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decrypt nostr secret: %w", err)
+			}
+			subscription.NostrSecret = &decryptedSecret
+		}
+	}
+
+	return subscriptions, nil
 }
 
 func (r *SubscriptionRepository) GetByProduct(productID uuid.UUID) ([]*Subscription, error) {
 	subscriptions := []*Subscription{}
 	err := db.Select(&subscriptions, "SELECT * FROM subscriptions WHERE product_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC", productID)
-	return subscriptions, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt the nostr secret for each subscription
+	for _, subscription := range subscriptions {
+		if subscription.NostrSecret != nil && *subscription.NostrSecret != "" {
+			decryptedSecret, err := decrypt(*subscription.NostrSecret)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decrypt nostr secret: %w", err)
+			}
+			subscription.NostrSecret = &decryptedSecret
+		}
+	}
+
+	return subscriptions, nil
 }
 
 func (r *SubscriptionRepository) Delete(id uuid.UUID) error {
@@ -229,7 +340,12 @@ func (s *SubscriptionService) GetByCustomer(customerID uuid.UUID) ([]*Subscripti
 }
 
 func (s *SubscriptionService) GetByProduct(productID uuid.UUID) ([]*Subscription, error) {
-	return subscriptionRepository.GetByProduct(productID)
+	subscriptions, err := subscriptionRepository.GetByProduct(productID)
+	if err != nil {
+		return nil, err
+	}
+
+	return subscriptions, nil
 }
 
 func (s *SubscriptionService) Delete(id uuid.UUID) error {
@@ -596,7 +712,22 @@ func (r *SubscriptionRepository) GetSubscriptionsDueForBilling(cutoffTime time.T
 		AND deleted_at IS NULL 
 		ORDER BY next_billing_date ASC`,
 		SubscriptionStatusActive, cutoffTime)
-	return subscriptions, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt the nostr secret for each subscription
+	for _, subscription := range subscriptions {
+		if subscription.NostrSecret != nil && *subscription.NostrSecret != "" {
+			decryptedSecret, err := decrypt(*subscription.NostrSecret)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decrypt nostr secret: %w", err)
+			}
+			subscription.NostrSecret = &decryptedSecret
+		}
+	}
+
+	return subscriptions, nil
 }
 
 func processSubscriptionRenewals() {
