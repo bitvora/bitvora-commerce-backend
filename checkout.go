@@ -126,21 +126,23 @@ func (r *CheckoutRepository) Update(checkout *Checkout) error {
 }
 
 func (r *CheckoutRepository) MarkExpired() error {
+	now := time.Now().UTC()
 	_, err := db.Exec(`
 		UPDATE checkouts 
 		SET state=$1, updated_at=$2
 		WHERE state=$3 AND expires_at < $2 AND deleted_at IS NULL`,
-		CheckoutStateExpired, time.Now(), CheckoutStateOpen)
+		CheckoutStateExpired, now, CheckoutStateOpen)
 	return err
 }
 
 func (r *CheckoutRepository) GetExpiredCheckouts() ([]*Checkout, error) {
 	checkouts := []*Checkout{}
+	now := time.Now().UTC()
 	err := db.Select(&checkouts, `
 		SELECT * FROM checkouts 
 		WHERE state=$1 AND expires_at < $2 AND deleted_at IS NULL 
 		ORDER BY created_at DESC`,
-		CheckoutStateOpen, time.Now())
+		CheckoutStateOpen, now)
 	return checkouts, err
 }
 
@@ -181,7 +183,7 @@ func (s *CheckoutService) handleExpiredCheckouts() {
 
 			for _, checkout := range expiredCheckouts {
 				checkout.State = CheckoutStateExpired
-				checkout.UpdatedAt = time.Now()
+				checkout.UpdatedAt = time.Now().UTC()
 
 				if err := checkoutRepository.Update(checkout); err != nil {
 					continue
@@ -206,8 +208,9 @@ func (s *CheckoutService) Stop() {
 }
 
 func (s *CheckoutService) Create(checkout *Checkout) (*Checkout, error) {
-	checkout.CreatedAt = time.Now()
-	checkout.UpdatedAt = time.Now()
+	now := time.Now().UTC()
+	checkout.CreatedAt = now
+	checkout.UpdatedAt = now
 	checkout.State = CheckoutStateOpen
 
 	// Set default type if not specified
@@ -217,7 +220,7 @@ func (s *CheckoutService) Create(checkout *Checkout) (*Checkout, error) {
 	// For single checkouts, automatically create a lightning invoice and bitcoin address
 	if checkout.Type == CheckoutTypeSingle {
 		if wallet, err := walletService.GetActiveWalletByAccount(checkout.AccountID); err == nil {
-			expirySeconds := int64(30 * 60)
+			expirySeconds := int64(30 * 60) // 30 minutes to match lightning invoice
 			description := fmt.Sprintf("Checkout #%s", checkout.ID.String())
 			mSatAmount := checkout.Amount * 1000
 			invoice, err := walletService.MakeInvoice(wallet.ID, mSatAmount, description, expirySeconds)
@@ -274,7 +277,7 @@ func (s *CheckoutService) UpdateState(id uuid.UUID, state CheckoutState, receive
 
 	checkout.State = state
 	checkout.ReceivedAmount = receivedAmount
-	checkout.UpdatedAt = time.Now()
+	checkout.UpdatedAt = time.Now().UTC()
 
 	err = checkoutRepository.Update(checkout)
 	if err != nil {
@@ -470,7 +473,7 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	expiryMinutes := 1440
+	expiryMinutes := 30 // Default to 30 minutes to match Lightning invoice expiry
 	if input.ExpiryMinutes > 0 {
 		expiryMinutes = input.ExpiryMinutes
 	}
@@ -486,7 +489,7 @@ func (h *CheckoutHandler) Create(w http.ResponseWriter, r *http.Request) {
 		RedirectURL:    input.RedirectURL,
 		Metadata:       input.Metadata,
 		Items:          input.Items,
-		ExpiresAt:      time.Now().Add(time.Duration(expiryMinutes) * time.Minute),
+		ExpiresAt:      time.Now().UTC().Add(time.Duration(expiryMinutes) * time.Minute),
 		ProductID:      input.ProductID,
 		Rates:          ratesJSON,
 	}
