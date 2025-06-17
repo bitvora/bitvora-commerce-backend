@@ -179,12 +179,15 @@ func sendNWCRequest(ctx context.Context, wallet *WalletConnection, method string
 		return nil, fmt.Errorf("failed to derive client public key: %w", err)
 	}
 
-	// Compute shared secret for encryption - try with prefix first for compatibility
-	walletPubKeyWithPrefix := "02" + wallet.NostrPubkey
-	sharedSecret, err := nip04.ComputeSharedSecret(walletPubKeyWithPrefix, clientSecretKey)
+	// Compute shared secret for encryption - try different approaches for compatibility
+	var sharedSecret []byte
+
+	// Approach 1: Standard order (wallet pubkey, client secret)
+	sharedSecret, err = nip04.ComputeSharedSecret(wallet.NostrPubkey, clientSecretKey)
 	if err != nil {
-		// Fallback to without prefix
-		sharedSecret, err = nip04.ComputeSharedSecret(wallet.NostrPubkey, clientSecretKey)
+		// Approach 2: Try with "02" prefix
+		walletPubKeyWithPrefix := "02" + wallet.NostrPubkey
+		sharedSecret, err = nip04.ComputeSharedSecret(walletPubKeyWithPrefix, clientSecretKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to compute shared secret: %w", err)
 		}
@@ -283,7 +286,7 @@ func sendNWCRequest(ctx context.Context, wallet *WalletConnection, method string
 	}
 }
 
-// decryptNWCResponse decrypts a response event content
+// decryptNWCResponse decrypts a response event content using multiple approaches for compatibility
 func decryptNWCResponse(event nostr.Event, clientSecKey, walletPubKey string) (string, error) {
 	logger.Debug("Decrypting response", "event_id", event.ID, "event_pubkey", event.PubKey)
 
@@ -293,23 +296,45 @@ func decryptNWCResponse(event nostr.Event, clientSecKey, walletPubKey string) (s
 		logger.Debug("Response pubkey differs from wallet pubkey", "expected", walletPubKey, "actual", event.PubKey)
 	}
 
-	// Try with prefix first for compatibility
-	responsePubKeyWithPrefix := "02" + responsePubKey
-	sharedSecret, err := nip04.ComputeSharedSecret(responsePubKeyWithPrefix, clientSecKey)
-	if err != nil {
-		// Fallback to without prefix
-		sharedSecret, err = nip04.ComputeSharedSecret(responsePubKey, clientSecKey)
-		if err != nil {
-			return "", fmt.Errorf("failed to compute shared secret for decryption: %w", err)
+	// Try multiple approaches for shared secret computation
+	var sharedSecret []byte
+	var err error
+
+	// Approach 1: Standard order (response pubkey, client secret) - most common
+	sharedSecret, err = nip04.ComputeSharedSecret(responsePubKey, clientSecKey)
+	if err == nil {
+		if decrypted, decErr := nip04.Decrypt(event.Content, sharedSecret); decErr == nil {
+			return decrypted, nil
 		}
 	}
 
-	decrypted, err := nip04.Decrypt(event.Content, sharedSecret)
-	if err != nil {
-		return "", fmt.Errorf("failed to decrypt content: %w", err)
+	// Approach 2: Try with "02" prefix
+	responsePubKeyWithPrefix := "02" + responsePubKey
+	sharedSecret, err = nip04.ComputeSharedSecret(responsePubKeyWithPrefix, clientSecKey)
+	if err == nil {
+		if decrypted, decErr := nip04.Decrypt(event.Content, sharedSecret); decErr == nil {
+			return decrypted, nil
+		}
 	}
 
-	return decrypted, nil
+	// Approach 3: Try the original wallet pubkey instead of response pubkey
+	sharedSecret, err = nip04.ComputeSharedSecret(walletPubKey, clientSecKey)
+	if err == nil {
+		if decrypted, decErr := nip04.Decrypt(event.Content, sharedSecret); decErr == nil {
+			return decrypted, nil
+		}
+	}
+
+	// Approach 4: Try original wallet pubkey with prefix
+	walletPubKeyWithPrefix := "02" + walletPubKey
+	sharedSecret, err = nip04.ComputeSharedSecret(walletPubKeyWithPrefix, clientSecKey)
+	if err == nil {
+		if decrypted, decErr := nip04.Decrypt(event.Content, sharedSecret); decErr == nil {
+			return decrypted, nil
+		}
+	}
+
+	return "", fmt.Errorf("failed to decrypt content using any approach")
 }
 
 type ResponsePromise struct {
